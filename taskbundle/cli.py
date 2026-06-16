@@ -6,12 +6,19 @@ exits cleanly. Flags, help text, and structure are final; bodies are not.
 
 from __future__ import annotations
 
+import json
+import uuid
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Optional
 
 import typer
 from rich.console import Console
+
+from taskbundle import bundle as bundle_mod
+from taskbundle import db
+from taskbundle.dataset import DatasetError, find_row
 
 app = typer.Typer(
     name="task",
@@ -38,9 +45,15 @@ def _not_implemented(command: str) -> None:
     raise typer.Exit(code=0)
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 @app.command()
 def init(
-    bundle: Path = typer.Option(..., "--bundle", help="Path to a task bundle directory."),
+    bundle: Optional[Path] = typer.Option(
+        None, "--bundle", help="Output bundle directory (with --from-dataset) or task bundle directory."
+    ),
     repo: Optional[str] = typer.Option(None, "--repo", help="Git repo URL."),
     commit: Optional[str] = typer.Option(None, "--commit", help="Base commit SHA."),
     image: Optional[str] = typer.Option(None, "--image", help="Prebuilt docker image reference."),
@@ -51,7 +64,55 @@ def init(
     ),
 ) -> None:
     """Create or scaffold a task bundle."""
-    _not_implemented("init")
+    if from_dataset is None:
+        _not_implemented("init: container initialization")
+    _init_from_dataset(from_dataset, bundle)
+
+
+def _init_from_dataset(instance_id: str, bundle: Optional[Path]) -> None:
+    """Build a task bundle from a SWE-Bench Pro dataset row."""
+    out_dir = Path(bundle) if bundle else bundle_mod.default_bundle_dir(instance_id)
+    command_id = uuid.uuid4().hex
+    started_at = _now_iso()
+    args_json = json.dumps(
+        {"from_dataset": instance_id, "bundle": str(out_dir)}, sort_keys=True
+    )
+
+    db.init_db()
+    try:
+        console.print(f"Fetching dataset row for [cyan]{instance_id}[/cyan] …")
+        item = find_row(instance_id)
+        summary = bundle_mod.build_bundle(item, out_dir)
+    except (DatasetError, ValueError, KeyError) as e:
+        db.record_command(
+            command_id=command_id,
+            command="init",
+            args_json=args_json,
+            bundle=str(out_dir),
+            status="error",
+            message=str(e)[:500],
+            started_at=started_at,
+            finished_at=_now_iso(),
+        )
+        console.print(f"[red]init failed:[/red] {e}")
+        raise typer.Exit(code=1)
+
+    db.record_command(
+        command_id=command_id,
+        command="init",
+        args_json=args_json,
+        bundle=summary["bundle_dir"],
+        status="success",
+        message=f"bundle built: {summary['n_f2p']} F2P / {summary['n_p2p']} P2P",
+        started_at=started_at,
+        finished_at=_now_iso(),
+    )
+    console.print(f"[green]✓ bundle written to[/green] [bold]{summary['bundle_dir']}[/bold]")
+    console.print(f"  image: {summary['image']}")
+    console.print(
+        f"  fail_to_pass: {summary['n_f2p']}  pass_to_pass: {summary['n_p2p']}"
+        f"  test_files: {summary['n_test_files']}"
+    )
 
 
 @app.command()
