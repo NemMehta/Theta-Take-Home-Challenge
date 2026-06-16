@@ -3,5 +3,6 @@ __pycache__/
 *.pyc
 .taskbundle/
 bundles/*/artifacts/
+scratch/
 *.egg-info/
 .claude/settings.local.json
