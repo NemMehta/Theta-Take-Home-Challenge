@@ -42,3 +42,9 @@ Build in phases; implement ONLY the current phase; stubs until told otherwise; c
 
 ## Roadmap
 P1 scaffold -> task init | P2 validate | P3 run + stubs + file-level masker + report + DB | P4 function-level masker | P5 real-model solver | P6 agentic
+
+## Environment notes
+- Host venv: Python 3.14, with venv-local pip bootstrapped via get-pip.py (system python3-venv/pip aren't installed; sudo is non-interactive here). To recreate the venv:
+  python3 -m venv .venv --without-pip && source .venv/bin/activate && curl -sS https://bootstrap.pypa.io/get-pip.py | python
+- The host Python only runs the `task` CLI. Task repositories and their tests run INSIDE their Docker images with their own Python — host Python version does not affect them.
+- Bleeding-edge Python 3.14 may lack wheels for some libraries (e.g. pyarrow/datasets). Prefer dependency-light, stdlib-based approaches on the host. For dataset access, use the Hugging Face datasets-server REST API via stdlib urllib, NOT the `datasets` package.
