@@ -63,3 +63,13 @@ The model works on the MASKED tree. Capture ONLY its source changes — exclude 
 
 ## init is stateless
 init verifies + discovers + records, then tears its container down. validate/run each start a fresh container. Discover (do NOT hardcode): the repo path inside the image, and a keep-alive invocation (the image's default entrypoint may be bash, which exits without a TTY). Record repo_path_in_container and image_digest into task.json.
+
+## Test execution (pytest)
+- The image's pytest is OLD (6.1.2). Do NOT rely on plugins (no pytest-json-report). For per-test pass/fail, run with built-in JUnit XML and parse it:
+  python -m pytest <node_ids...> --junitxml=/tmp/pytest_report.xml -p no:cacheprovider -o cache_dir=/tmp/pytest_cache -rN
+  run from repo_path_in_container; capture rc/stdout/stderr; then read & parse /tmp/pytest_report.xml.
+- Outcome per <testcase>: child <failure> -> failed, <error> -> error, <skipped> -> skipped, none -> passed. "passed" means outcome==passed; an F2P "fails" = any non-passed outcome.
+- Map <testcase> -> node ID by the leaf test name (substring after the last "::"); disambiguate Class::method IDs by checking the class appears in <testcase classname>. Any expected node ID with NO testcase -> "missing".
+- Instance commit derived from instance_id via regex -([0-9a-f]{40})-v (confirmed in image history); shared helper, no hardcoding.
+- Test staging for scoring: git checkout <instance_commit> -- <each selected_test_file> (preferred; overwrites tampering). git apply test_patch.diff is the fallback.
+- This runner module is shared by validate and run.
