@@ -1,17 +1,22 @@
-"""Pluggable test-hiding "masker" (file-level baseline).
+"""Pluggable test-hiding "masker".
 
 The masker edits the SOLVE working tree so the solver cannot see the scored
 tests. Scoring re-stages the real tests afterwards, so masking never affects the
-score. File-level masking deletes whole selected test files; the function-level
-masker (Phase 4) will remove only the scored functions.
+score. Two strategies:
+- file-level: delete each selected test file (over-hides unrelated tests).
+- function-level (Python, default): parse with `ast` and remove ONLY the scored
+  test functions/methods, preserving every other test. Falls back to file-level
+  delete per-file if anything is unsafe (never leaves a scored test visible).
 """
 
 from __future__ import annotations
 
 import ast
+import os
 import shlex
+import tempfile
 from dataclasses import dataclass, field, asdict
-from typing import Any
+from typing import Any, Optional
 
 
 @dataclass
@@ -22,9 +27,24 @@ class MaskResult:
     scored_hidden: int = 0
     non_scored_hidden: int = 0
     non_scored_names: list[str] = field(default_factory=list)
+    removed_tests: list[str] = field(default_factory=list)
+    preserved_tests: list[str] = field(default_factory=list)
+    per_file: list[dict] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def parse_node_id(node_id: str) -> tuple[str, Optional[str], str]:
+    """Split a pytest node ID into (file_path, class_name|None, func_name).
+
+    Strips any parametrization suffix '[...]' from the leaf.
+    """
+    parts = node_id.split("::")
+    file_path = parts[0]
+    leaf = parts[-1].split("[", 1)[0]
+    class_name = parts[-2] if len(parts) >= 3 else None
+    return file_path, class_name, leaf
 
 
 def _collect_tests(source: str) -> list[str]:
@@ -41,49 +61,179 @@ def _collect_tests(source: str) -> list[str]:
     return names
 
 
+def _classify(names: list[str], tf: str, scored_node_ids) -> tuple[list[str], list[str]]:
+    """Split collected test names into (scored, non_scored) for file `tf`."""
+    scored_leaves = {parse_node_id(n)[2] for n in scored_node_ids if parse_node_id(n)[0] == tf}
+    scored, non_scored = [], []
+    for name in names:
+        leaf = name.split("::")[-1]
+        (scored if leaf in scored_leaves else non_scored).append(name)
+    return scored, non_scored
+
+
+def _is_test_def(node) -> bool:
+    return isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_")
+
+
+def _span(node) -> tuple[int, int]:
+    """1-indexed inclusive line span of a def, including decorators."""
+    start = node.lineno
+    if node.decorator_list:
+        start = min(start, min(d.lineno for d in node.decorator_list))
+    return start, node.end_lineno
+
+
 class FileLevelMasker:
-    """Delete each selected test file from the working tree (hides everything
-    in it). Counts scored vs non-scored tests first for reporting."""
+    """Delete each selected test file from the working tree (hides everything)."""
 
     strategy = "file"
 
     def mask(self, handle, repo_path, selected_test_files, scored_node_ids) -> MaskResult:
         result = MaskResult(strategy=self.strategy)
-        # Index scored leaf/segment forms for matching against ast names.
-        scored_leaves = {nid.split("::", 1)[-1] for nid in scored_node_ids}
         for tf in selected_test_files:
-            rc, source, err = handle.exec(f"cat {shlex.quote(repo_path)}/{shlex.quote(tf)}")
+            rc, source, _ = handle.exec(f"cat {shlex.quote(repo_path)}/{shlex.quote(tf)}")
             if rc != 0:
-                # File missing from the tree; nothing to hide for it.
+                continue
+            _apply_file_delete(handle, repo_path, tf, source, scored_node_ids, result,
+                               strategy_used="file", fallback_reason=None)
+        return result
+
+
+def _apply_file_delete(handle, repo_path, tf, source, scored_node_ids, result,
+                       strategy_used, fallback_reason) -> None:
+    """Delete `tf` from the working tree and update `result` accounting."""
+    try:
+        names = _collect_tests(source)
+    except SyntaxError:
+        names = []
+    scored, non_scored = _classify(names, tf, scored_node_ids)
+    result.total_tests_hidden += len(scored) + len(non_scored)
+    result.scored_hidden += len(scored)
+    result.non_scored_hidden += len(non_scored)
+    result.non_scored_names.extend(n.split("::")[-1] for n in non_scored)
+    result.removed_tests.extend(n.split("::")[-1] for n in scored)
+    handle.exec(f"rm -f {shlex.quote(repo_path)}/{shlex.quote(tf)}", check=False)
+    result.masked_files.append(tf)
+    result.per_file.append({
+        "file": tf, "strategy_used": strategy_used,
+        "removed": [n.split("::")[-1] for n in scored],
+        "preserved": [],
+        "fallback_reason": fallback_reason,
+    })
+
+
+class FunctionLevelMasker:
+    """Remove only the scored test functions/methods via AST surgery; preserve
+    all other tests. Falls back to file-level delete per-file when unsafe."""
+
+    strategy = "function"
+
+    def mask(self, handle, repo_path, selected_test_files, scored_node_ids) -> MaskResult:
+        result = MaskResult(strategy=self.strategy)
+        for tf in selected_test_files:
+            # Scored targets for THIS file: {(class_name|None, func_name)}.
+            targets = {
+                (parse_node_id(n)[1], parse_node_id(n)[2])
+                for n in scored_node_ids if parse_node_id(n)[0] == tf
+            }
+            if not targets:
+                continue
+
+            rc, source, _ = handle.exec(f"cat {shlex.quote(repo_path)}/{shlex.quote(tf)}")
+            if rc != 0:
+                _apply_file_delete(handle, repo_path, tf, "", scored_node_ids, result,
+                                   "file-fallback", "cat failed")
                 continue
             try:
-                names = _collect_tests(source)
-            except SyntaxError:
-                names = []
-            for name in names:
-                result.total_tests_hidden += 1
-                # name is 'test_x' or 'Class::test_x'; match the post-:: form.
-                leaf = name.split("::")[-1]
-                node_form = name  # 'Class::test_x' or 'test_x'
-                is_scored = (
-                    node_form in scored_leaves
-                    or leaf in scored_leaves
-                    or f"{tf}::{name}" in scored_node_ids
-                )
-                if is_scored:
-                    result.scored_hidden += 1
-                else:
-                    result.non_scored_hidden += 1
-                    result.non_scored_names.append(name)
-            # Working-tree deletion only (NOT git rm) so capture stays clean.
-            handle.exec(f"rm -f {shlex.quote(repo_path)}/{shlex.quote(tf)}", check=False)
+                tree = ast.parse(source)
+            except SyntaxError as e:
+                _apply_file_delete(handle, repo_path, tf, source, scored_node_ids, result,
+                                   "file-fallback", f"parse failed: {e}")
+                continue
+
+            edits: list[tuple[int, int, list[str]]] = []  # (start, end, replacement)
+            matched: set[tuple[Optional[str], str]] = set()
+            removed_leaves: list[str] = []
+
+            for node in tree.body:
+                if _is_test_def(node) and (None, node.name) in targets:
+                    s, e = _span(node)
+                    edits.append((s, e, []))
+                    matched.add((None, node.name))
+                    removed_leaves.append(node.name)
+                elif isinstance(node, ast.ClassDef):
+                    removed_methods = []
+                    for sub in node.body:
+                        if _is_test_def(sub) and (node.name, sub.name) in targets:
+                            removed_methods.append(sub)
+                            matched.add((node.name, sub.name))
+                            removed_leaves.append(sub.name)
+                    if not removed_methods:
+                        continue
+                    remaining = [st for st in node.body if st not in removed_methods]
+                    # If removing empties the class body, replace the first removed
+                    # method's span with a `pass` at its indent.
+                    pass_idx = None
+                    if not remaining:
+                        first = min(removed_methods, key=lambda m: m.lineno)
+                        pass_idx = id(first)
+                    for m in removed_methods:
+                        s, e = _span(m)
+                        repl = [" " * m.col_offset + "pass\n"] if id(m) == pass_idx else []
+                        edits.append((s, e, repl))
+
+            # SAFETY: every scored target for this file must have matched.
+            unmatched = targets - matched
+            if unmatched:
+                _apply_file_delete(handle, repo_path, tf, source, scored_node_ids, result,
+                                   "file-fallback",
+                                   f"unmatched scored test(s): {sorted(unmatched)}")
+                continue
+
+            # Apply edits to source lines, descending by start.
+            lines = source.splitlines(keepends=True)
+            for start, end, repl in sorted(edits, key=lambda x: x[0], reverse=True):
+                lines[start - 1:end] = repl
+            new_content = "".join(lines)
+
+            try:
+                ast.parse(new_content)
+            except SyntaxError as e:
+                _apply_file_delete(handle, repo_path, tf, source, scored_node_ids, result,
+                                   "file-fallback", f"post-edit parse failed: {e}")
+                continue
+
+            # Write the edited file back into the container working tree.
+            _write_back(handle, repo_path, tf, new_content)
+
+            preserved = _collect_tests(new_content)
+            preserved_leaves = [p.split("::")[-1] for p in preserved]
             result.masked_files.append(tf)
+            result.total_tests_hidden += len(removed_leaves)
+            result.scored_hidden += len(removed_leaves)
+            result.removed_tests.extend(removed_leaves)
+            result.preserved_tests.extend(preserved_leaves)
+            result.per_file.append({
+                "file": tf, "strategy_used": "function",
+                "removed": removed_leaves, "preserved": preserved_leaves,
+                "fallback_reason": None,
+            })
         return result
+
+
+def _write_back(handle, repo_path, tf, content) -> None:
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8")
+    try:
+        tmp.write(content)
+        tmp.close()
+        handle.cp_to(tmp.name, f"{repo_path}/{tf}")
+    finally:
+        os.unlink(tmp.name)
 
 
 def get_masker(strategy: str):
     if strategy == "file":
         return FileLevelMasker()
     if strategy == "function":
-        raise NotImplementedError("function-level masker arrives in Phase 4")
+        return FunctionLevelMasker()
     raise ValueError(f"unknown mask strategy: {strategy}")
