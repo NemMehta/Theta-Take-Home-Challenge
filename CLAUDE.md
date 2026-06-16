@@ -24,11 +24,9 @@ init, validate, run, log, runs (plus `init --from-dataset <instance_id>`).
 All repo/test/solver-output execution happens INSIDE the container; the host only orchestrates and never executes untrusted output. Test/solve phases run with `--network none` and resource limits (--memory, --cpus, --pids-limit). Bundles are copied in, not bind-mounted from sensitive host paths.
 
 ## Test-hiding (pluggable "masker")
-Model must not see F2P/P2P during a run, but must see all other tests.
-IMPORTANT: in SWE-bench Pro the scored tests usually ALREADY EXIST at the base commit (confirmed on our instance: all 9 scored tests are present in test_adhoc.py at base). Hiding is therefore NOT achieved by "skipping the test patch" — it is done by the masker editing the BASELINE working tree:
-- Baseline masker (ship first): file-level — delete each file in selected_test_files (hides every scored test in those files; also hides any unrelated test in the same file).
-- Upgrade (Phase 4): function-level — parse each scored file with `ast` and remove ONLY the scored test functions/methods (matched to node IDs), leaving unrelated tests intact. File-level stays the fallback for non-Python.
-The model edits source on the masked tree; scored tests are restored only for scoring (see staging).
+Model must not see F2P/P2P during a run but must see all other tests. Scored tests USUALLY PRE-EXIST at the base commit, so hiding = the masker editing the BASELINE working tree (not skipping the test patch). Maskers only affect what the SOLVER sees; scoring re-stages the real test files, so masking never changes scores. Capture restores masked files via `git checkout <base> -- <file>` before diffing, so neither deletions nor edits leak into the solver patch.
+- file-level (FileLevelMasker): `rm -f` each selected test file. Simple, language-agnostic; OVER-HIDES unrelated tests in the same file.
+- function-level (FunctionLevelMasker, default for Python): parse each selected test file with `ast`, remove ONLY the scored test functions/methods (matched by node ID), preserve all other tests. Fail-safe: if a file can't be parsed, or any scored test can't be located, or the edited file wouldn't parse, FALL BACK to file-level delete for that file (never leave a scored test visible). If removing methods empties a class body, insert `pass`.
 
 ## Solver (pluggable, tiered)
 noop / gold / command stubs (default noop) → single-shot Anthropic (returns full changed-file contents; we git diff) → bounded agentic (stretch). Real model deferred; will use an Anthropic API key or `claude -p` (Agent SDK credit).
