@@ -25,8 +25,10 @@ All repo/test/solver-output execution happens INSIDE the container; the host onl
 
 ## Test-hiding (pluggable "masker")
 Model must not see F2P/P2P during a run, but must see all other tests.
-- Baseline (ship first): file-level — skip test_patch (hides F2P) and remove the scored test files (hides P2P).
-- Upgrade (later): function-level — a Python `ast` masker removing only the named test functions, leaving other tests in the same file visible. File-level stays the fallback for non-Python.
+IMPORTANT: in SWE-bench Pro the scored tests usually ALREADY EXIST at the base commit (confirmed on our instance: all 9 scored tests are present in test_adhoc.py at base). Hiding is therefore NOT achieved by "skipping the test patch" — it is done by the masker editing the BASELINE working tree:
+- Baseline masker (ship first): file-level — delete each file in selected_test_files (hides every scored test in those files; also hides any unrelated test in the same file).
+- Upgrade (Phase 4): function-level — parse each scored file with `ast` and remove ONLY the scored test functions/methods (matched to node IDs), leaving unrelated tests intact. File-level stays the fallback for non-Python.
+The model edits source on the masked tree; scored tests are restored only for scoring (see staging).
 
 ## Solver (pluggable, tiered)
 noop / gold / command stubs (default noop) → single-shot Anthropic (returns full changed-file contents; we git diff) → bounded agentic (stretch). Real model deferred; will use an Anthropic API key or `claude -p` (Agent SDK credit).
@@ -48,3 +50,16 @@ P1 scaffold -> task init | P2 validate | P3 run + stubs + file-level masker + re
   python3 -m venv .venv --without-pip && source .venv/bin/activate && curl -sS https://bootstrap.pypa.io/get-pip.py | python
 - The host Python only runs the `task` CLI. Task repositories and their tests run INSIDE their Docker images with their own Python — host Python version does not affect them.
 - Bleeding-edge Python 3.14 may lack wheels for some libraries (e.g. pyarrow/datasets). Prefer dependency-light, stdlib-based approaches on the host. For dataset access, use the Hugging Face datasets-server REST API via stdlib urllib, NOT the `datasets` package.
+
+## Staging tests for scoring (validate/run)
+Scoring runs the scored node IDs against the INSTANCE-commit version of the test files.
+- Prefer: `git checkout <instance_commit> -- <selected test files>` (robust; overwrites any solver tampering; the prebuilt image has the instance commit in history).
+- Fallback (for a self-contained bundle without the commit): `git apply test_patch.diff`.
+- validate: fresh baseline -> stage instance test files -> run (expect F2P fail, P2P pass); then ALSO apply gold patch -> run (expect F2P pass, P2P pass).
+- run scoring: fresh baseline -> apply SOLVER patch (source) -> stage instance test files -> run scored node IDs.
+
+## Solver patch capture
+The model works on the MASKED tree. Capture ONLY its source changes — exclude or restore the masked test files before diffing, so the masker's deletions don't leak into the solver patch. Scoring re-stages tests regardless, overwriting any model edits to test files.
+
+## init is stateless
+init verifies + discovers + records, then tears its container down. validate/run each start a fresh container. Discover (do NOT hardcode): the repo path inside the image, and a keep-alive invocation (the image's default entrypoint may be bash, which exits without a TTY). Record repo_path_in_container and image_digest into task.json.
