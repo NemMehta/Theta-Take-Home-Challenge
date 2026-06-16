@@ -74,3 +74,12 @@ init verifies + discovers + records, then tears its container down. validate/run
 - Instance commit derived from instance_id via regex -([0-9a-f]{40})-v (confirmed in image history); shared helper, no hardcoding.
 - Test staging for scoring: git checkout <instance_commit> -- <each selected_test_file> (preferred; overwrites tampering). git apply test_patch.diff is the fallback.
 - This runner module is shared by validate and run.
+
+## run lifecycle
+`task run` solves then scores in ONE container, with a fresh baseline between:
+- SOLVE: clean baseline -> masker hides scored tests (file-level = delete selected test files; function-level (P4) = remove only scored functions) -> solver produces a SOURCE patch. Capture EXCLUDES the masker's changes: restore masked files, then `git add -A && git diff --cached`.
+- SCORE: fresh baseline (reset --hard) -> `git apply` solver patch -> stage instance test files (git checkout <instance_commit> -- <files>) -> run scored node IDs (shared runner, --forked).
+- resolved = patch_applied AND all F2P passed AND all P2P passed. reason in {resolved, patch_apply_failed, f2p_not_passed, p2p_regressed}.
+- Masker affects only the SOLVE tree; scoring re-stages real tests, so masking never changes scores.
+- Isolation: run's container uses --network none (default; --network to opt in) + --memory/--cpus/--pids-limit. Command-solver commands and the repo's tests execute ONLY in the container; the host never runs them.
+- Report: one JSON per run at bundles/<id>/artifacts/<run_id>/report.json (also --out). DB: a commands row + a runs row (per-test detail in runs.results_json). This report is the evaluation-artifact deliverable.
