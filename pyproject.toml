@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "taskbundle"
+version = "0.1.0"
+description = "CLI that packages SWE-bench-style coding tasks into Docker containers and runs/scores LLM solutions."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "typer>=0.12",
+    "rich",
+]
+
+[project.scripts]
+task = "taskbundle.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["taskbundle*"]
