@@ -22,7 +22,9 @@ from rich.table import Table
 from taskbundle import bundle as bundle_mod
 from taskbundle import container as container_mod
 from taskbundle import db
+from taskbundle import masker as masker_mod
 from taskbundle import runner as runner_mod
+from taskbundle import solver as solver_mod
 from taskbundle.dataset import DatasetError, find_row
 
 app = typer.Typer(
@@ -42,6 +44,13 @@ class Solver(str, Enum):
     gold = "gold"
     command = "command"
     anthropic = "anthropic"
+
+
+class Mask(str, Enum):
+    """Available test-hiding strategies."""
+
+    file = "file"
+    function = "function"
 
 
 def _not_implemented(command: str) -> None:
@@ -551,6 +560,9 @@ def run(
     solver_cmd: Optional[str] = typer.Option(
         None, "--solver-cmd", help="Command to run for the 'command' solver."
     ),
+    mask: Mask = typer.Option(
+        Mask.file, "--mask", help="Test-hiding strategy shown to the solver."
+    ),
     out: Optional[Path] = typer.Option(
         None, "--out", help="Write the JSON report to this path."
     ),
@@ -566,7 +578,238 @@ def run(
     ),
 ) -> None:
     """Run a solver against a bundle and score the result."""
-    _not_implemented("run")
+    _run_bundle(Path(bundle), solver.value, solver_cmd, mask.value, out,
+                no_network, keep_container)
+
+
+def _run_bundle(bundle_dir, solver_name, solver_cmd, mask_strategy, out,
+                no_network, keep_container) -> None:
+    run_id = uuid.uuid4().hex
+    command_id = uuid.uuid4().hex
+    started_at = _now_iso()
+    args_json = json.dumps({
+        "bundle": str(bundle_dir), "solver": solver_name, "solver_cmd": solver_cmd,
+        "mask": mask_strategy, "out": str(out) if out else None,
+        "no_network": no_network, "keep_container": keep_container,
+    }, sort_keys=True)
+    db.init_db()
+
+    def record_cmd(status: str, message: str) -> None:
+        db.record_command(
+            command_id=command_id, command="run", args_json=args_json,
+            bundle=str(bundle_dir), status=status, message=message[:500],
+            started_at=started_at, finished_at=_now_iso(),
+        )
+
+    def error_exit(msg: str):
+        record_cmd("error", msg)
+        console.print(f"[red]run errored:[/red] {msg}")
+        raise typer.Exit(code=2)
+
+    # Resolve masker + solver early; NotImplementedError -> clean exit 0.
+    try:
+        masker = masker_mod.get_masker(mask_strategy)
+    except NotImplementedError as e:
+        console.print(f"[yellow]mask '{mask_strategy}' not implemented yet:[/yellow] {e}")
+        raise typer.Exit(code=0)
+    try:
+        solver = solver_mod.get_solver(solver_name, solver_cmd)
+    except NotImplementedError as e:
+        console.print(f"[yellow]solver '{solver_name}' not implemented yet:[/yellow] {e}")
+        raise typer.Exit(code=0)
+
+    task_path = bundle_dir / "task.json"
+    if not task_path.exists():
+        error_exit(f"task.json not found: {task_path}")
+    task = json.loads(task_path.read_text(encoding="utf-8"))
+    image = task["image"]
+    base_commit = task["base_commit"]
+    repo_path = task.get("repo_path_in_container") or "/app"
+    instance_id = task["instance_id"]
+    image_digest = task.get("image_digest")
+    selected_test_files = task.get("test", {}).get("selected_test_files", [])
+    f2p = json.loads((bundle_dir / "tests" / "fail_to_pass.json").read_text())
+    p2p = json.loads((bundle_dir / "tests" / "pass_to_pass.json").read_text())
+    scored = list(f2p) + list(p2p)
+
+    try:
+        instance_commit = runner_mod.instance_commit_from_id(instance_id)
+    except runner_mod.RunnerError as e:
+        error_exit(str(e))
+
+    if not container_mod.image_exists(image):
+        error_exit(f"image not present locally: {image}")
+
+    network = "none" if no_network else None
+    artifacts_dir = bundle_dir / "artifacts" / run_id
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+    console.print(f"Running [cyan]{instance_id}[/cyan]")
+    console.print(f"  solver: {solver_name}  |  mask: {mask_strategy}  |  "
+                  f"network: {network or 'default'}  |  run_id: {run_id[:12]}")
+
+    report = {
+        "run_id": run_id, "command_id": command_id, "instance_id": instance_id,
+        "image": image, "image_digest": image_digest, "base_commit": base_commit,
+        "instance_commit": instance_commit,
+        "solver": {"name": solver_name, "meta": {}},
+        "mask": None, "mask_verification": {"scored_visible_after_mask": None},
+        "patch": {"applied": False, "apply_error": None, "lines": 0},
+        "scoring": {"by_node": {}, "f2p": {"total": len(f2p), "passed": 0},
+                    "p2p": {"total": len(p2p), "passed": 0}},
+        "resolved": False, "reason": None,
+        "started_at": started_at, "finished_at": None,
+    }
+
+    def clean_baseline(c):
+        for cmd in (f"git -C {repo_path} reset --hard {base_commit}",
+                    f"git -C {repo_path} clean -fd",
+                    f"git -C {repo_path} checkout {base_commit}"):
+            rc, _, err = c.exec(cmd)
+            if rc != 0:
+                raise runner_mod.RunnerError(f"baseline reset failed: {cmd}\n{err.strip()}")
+
+    scoring = None
+    try:
+        cm = container_mod.container_session(
+            image, network=network, memory="4g", cpus="2", pids_limit=512)
+        c = cm.__enter__()
+        kept_name = c.name
+        try:
+            # ---- A) SOLVE ----
+            clean_baseline(c)
+            mask_res = masker.mask(c, repo_path, selected_test_files, scored)
+            report["mask"] = mask_res.as_dict()
+
+            # MASK VERIFICATION: measure the masked tree the SOLVER will see,
+            # BEFORE the solver runs (a command solver may restore files during
+            # patch capture). How many scored node IDs remain collectable?
+            visible = 0
+            for tf in selected_test_files:
+                rc, out_c, _ = c.exec(
+                    f"python -m pytest --collect-only -q {tf}", workdir=repo_path)
+                if rc == 0:
+                    ids = _parse_collected(out_c, tf)
+                    visible += sum(1 for n in scored if n in ids)
+            report["mask_verification"]["scored_visible_after_mask"] = visible
+
+            solve_res = solver.solve(c, repo_path, base_commit, bundle_dir,
+                                     mask_res, selected_test_files)
+            report["solver"]["meta"] = solve_res.meta
+            if solve_res.error:
+                error_exit(f"solver error: {solve_res.error}")
+            (artifacts_dir / "solver_patch.diff").write_text(
+                solve_res.patch, encoding="utf-8")
+
+            # ---- B) SCORE ----
+            clean_baseline(c)
+            patch = solve_res.patch
+            if patch.strip():
+                c.cp_to(str(artifacts_dir / "solver_patch.diff"), "/tmp/solver_patch.diff")
+                rc, _, err = c.exec(f"git -C {repo_path} apply --check /tmp/solver_patch.diff")
+                if rc != 0:
+                    report["patch"]["applied"] = False
+                    report["patch"]["apply_error"] = err.strip()
+                    report["reason"] = "patch_apply_failed"
+                else:
+                    rc2, _, err2 = c.exec(f"git -C {repo_path} apply /tmp/solver_patch.diff")
+                    if rc2 != 0:
+                        report["patch"]["applied"] = False
+                        report["patch"]["apply_error"] = err2.strip()
+                        report["reason"] = "patch_apply_failed"
+                    else:
+                        report["patch"]["applied"] = True
+            else:
+                report["patch"]["applied"] = True  # empty no-op patch
+            report["patch"]["lines"] = patch.count("\n")
+
+            if report["patch"]["applied"]:
+                runner_mod.stage_tests(c, repo_path, instance_commit, selected_test_files)
+                scoring = runner_mod.run_pytest(c, repo_path, scored)
+                if scoring.get("error"):
+                    error_exit(f"scoring pytest could not run: {scoring['error']}\n"
+                               f"{scoring['stdout_tail']}\n{scoring['stderr_tail']}")
+                report["scoring"]["by_node"] = scoring["by_node"]
+                report["scoring"]["f2p"]["passed"] = sum(
+                    1 for n in f2p if scoring["by_node"].get(n) == "passed")
+                report["scoring"]["p2p"]["passed"] = sum(
+                    1 for n in p2p if scoring["by_node"].get(n) == "passed")
+        finally:
+            if keep_container:
+                console.print(f"[yellow]--keep-container:[/yellow] left container "
+                              f"[bold]{kept_name}[/bold] (docker rm -f {kept_name}).")
+            else:
+                cm.__exit__(None, None, None)
+    except container_mod.ContainerError as e:
+        error_exit(f"container error: {e}")
+    except runner_mod.RunnerError as e:
+        error_exit(str(e))
+
+    # ---- VERDICT ----
+    f2p_passed = report["scoring"]["f2p"]["passed"]
+    p2p_passed = report["scoring"]["p2p"]["passed"]
+    applied = report["patch"]["applied"]
+    f2p_ok = applied and f2p_passed == len(f2p)
+    p2p_ok = applied and p2p_passed == len(p2p)
+    resolved = bool(applied and f2p_ok and p2p_ok)
+    report["resolved"] = resolved
+    if report["reason"] is None:
+        if resolved:
+            report["reason"] = "resolved"
+        else:
+            reasons = []
+            if not f2p_ok:
+                reasons.append("f2p_not_passed")
+            if not p2p_ok:
+                reasons.append("p2p_regressed")
+            report["reason"] = "+".join(reasons) if reasons else "not_resolved"
+    report["finished_at"] = _now_iso()
+
+    # ---- WRITE REPORT ----
+    report_path = artifacts_dir / "report.json"
+    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    if out:
+        Path(out).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
+    # ---- DB ----
+    db.record_run(
+        run_id=run_id, command_id=command_id, instance_id=instance_id,
+        solver=solver_name, image=image, commit_sha=base_commit,
+        resolved=1 if resolved else 0,
+        f2p_total=len(f2p), f2p_passed=f2p_passed,
+        p2p_total=len(p2p), p2p_passed=p2p_passed,
+        results_json=json.dumps(report["scoring"]["by_node"]),
+        patch_applied=1 if applied else 0, report_path=str(report_path),
+        started_at=started_at, finished_at=report["finished_at"],
+    )
+    record_cmd("success", f"{'RESOLVED' if resolved else 'NOT RESOLVED'} "
+               f"({report['reason']}); F2P {f2p_passed}/{len(f2p)}, P2P {p2p_passed}/{len(p2p)}")
+
+    # ---- RICH OUTPUT ----
+    mr = report["mask"]
+    console.print(f"\n[bold]Mask[/bold] ({mr['strategy']}): hid files {mr['masked_files']}; "
+                  f"scored_hidden={mr['scored_hidden']}, "
+                  f"non_scored_hidden={mr['non_scored_hidden']} {mr['non_scored_names']}; "
+                  f"scored_visible_after_mask={report['mask_verification']['scored_visible_after_mask']}")
+    if not applied:
+        console.print(f"[red]patch did not apply:[/red] {report['patch']['apply_error']}")
+    else:
+        table = Table(title="Scoring")
+        table.add_column("node"); table.add_column("bucket")
+        table.add_column("outcome"); table.add_column("OK")
+        for node in scored:
+            bucket = "F2P" if node in f2p else "P2P"
+            outcome = report["scoring"]["by_node"].get(node, "missing")
+            ok = outcome == "passed"
+            table.add_row(node.split("::", 1)[-1], bucket, outcome,
+                          "[green]OK[/green]" if ok else "[red]✗[/red]")
+        console.print(table)
+    console.print(f"  report: {report_path}")
+    if resolved:
+        console.print(f"[bold green]RESOLVED[/bold green] (reason: {report['reason']})")
+    else:
+        console.print(f"[bold red]NOT RESOLVED[/bold red] (reason: {report['reason']})")
+    raise typer.Exit(code=0)
 
 
 @app.command()
@@ -574,7 +817,44 @@ def log(
     id: str = typer.Option(..., "--id", help="A command_id or run_id to show the log for."),
 ) -> None:
     """Show the recorded log for a command or run."""
-    _not_implemented("log")
+    db.init_db()
+    run = db.get_run(id) or _prefix_lookup(db.list_runs(1000), "run_id", id)
+    if run:
+        console.print(f"[bold]run[/bold] {run['run_id']}")
+        for k in ("command_id", "instance_id", "solver", "image", "commit_sha",
+                  "resolved", "f2p_total", "f2p_passed", "p2p_total", "p2p_passed",
+                  "patch_applied", "report_path", "started_at", "finished_at"):
+            console.print(f"  {k}: {run[k]}")
+        try:
+            by_node = json.loads(run["results_json"] or "{}")
+        except (TypeError, ValueError):
+            by_node = {}
+        if by_node:
+            table = Table(title="Per-node results")
+            table.add_column("node"); table.add_column("outcome"); table.add_column("OK")
+            for node, outcome in by_node.items():
+                ok = outcome == "passed"
+                table.add_row(node.split("::", 1)[-1], outcome,
+                              "[green]OK[/green]" if ok else "[red]✗[/red]")
+            console.print(table)
+        raise typer.Exit(code=0)
+
+    cmd = db.get_command(id) or _prefix_lookup(db.list_commands(1000), "command_id", id)
+    if cmd:
+        console.print(f"[bold]command[/bold] {cmd['command_id']}")
+        for k in ("command", "args_json", "bundle", "status", "message",
+                  "started_at", "finished_at"):
+            console.print(f"  {k}: {cmd[k]}")
+        raise typer.Exit(code=0)
+
+    console.print(f"[red]no command or run with id {id}[/red]")
+    raise typer.Exit(code=1)
+
+
+def _prefix_lookup(rows, key, value):
+    """Return the single row whose key starts with value, else None."""
+    matches = [r for r in rows if str(r[key]).startswith(value)]
+    return matches[0] if len(matches) == 1 else None
 
 
 @app.command()
@@ -582,7 +862,24 @@ def runs(
     limit: int = typer.Option(20, "--limit", help="Maximum number of runs to list."),
 ) -> None:
     """List recent runs."""
-    _not_implemented("runs")
+    db.init_db()
+    rows = db.list_runs(limit)
+    if not rows:
+        console.print("[yellow]no runs recorded yet[/yellow]")
+        raise typer.Exit(code=0)
+    table = Table(title=f"runs (latest {len(rows)})")
+    for col in ("run_id", "instance", "solver", "resolved", "F2P", "P2P", "finished_at"):
+        table.add_column(col)
+    for r in rows:
+        resolved = "[green]✓[/green]" if r["resolved"] else "[red]✗[/red]"
+        inst = (r["instance_id"] or "")
+        inst_short = inst[:28] + "…" if len(inst) > 29 else inst
+        table.add_row(
+            (r["run_id"] or "")[:12], inst_short, r["solver"] or "", resolved,
+            f"{r['f2p_passed']}/{r['f2p_total']}", f"{r['p2p_passed']}/{r['p2p_total']}",
+            r["finished_at"] or "",
+        )
+    console.print(table)
 
 
 def main() -> None:

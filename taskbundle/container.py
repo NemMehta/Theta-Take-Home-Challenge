@@ -94,13 +94,16 @@ _KEEPALIVE = [
 
 @contextmanager
 def container_session(
-    image: str, name: Optional[str] = None, network: Optional[str] = None
+    image: str, name: Optional[str] = None, network: Optional[str] = None,
+    memory: Optional[str] = None, cpus: Optional[str] = None,
+    pids_limit: Optional[int] = None,
 ) -> Iterator[ContainerHandle]:
     """Start a detached keep-alive container; yield a handle; always remove it.
 
     Overrides the image entrypoint so the container does not launch the image's
     default (e.g. interactive bash). Tries each keep-alive in turn, surfacing the
-    entrypoint/cmd and `docker logs` if none stays running.
+    entrypoint/cmd and `docker logs` if none stays running. Optional resource
+    limits (memory/cpus/pids_limit) are passed to `docker run` when provided.
     """
     if not image_exists(image):
         raise ContainerError(f"image not present locally: {image}")
@@ -114,6 +117,12 @@ def container_session(
         run_args = ["docker", "run", "-d", "--name", name, "--entrypoint", binary]
         if network:
             run_args += ["--network", network]
+        if memory:
+            run_args += ["--memory", memory]
+        if cpus:
+            run_args += ["--cpus", cpus]
+        if pids_limit:
+            run_args += ["--pids-limit", str(pids_limit)]
         run_args += [image, *tail_args]
         rc, out, err = _run(run_args)
         if rc != 0:
