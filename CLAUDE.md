@@ -65,9 +65,10 @@ The model works on the MASKED tree. Capture ONLY its source changes — exclude 
 init verifies + discovers + records, then tears its container down. validate/run each start a fresh container. Discover (do NOT hardcode): the repo path inside the image, and a keep-alive invocation (the image's default entrypoint may be bash, which exits without a TTY). Record repo_path_in_container and image_digest into task.json.
 
 ## Test execution (pytest)
-- The image's pytest is OLD (6.1.2). Do NOT rely on plugins (no pytest-json-report). For per-test pass/fail, run with built-in JUnit XML and parse it:
-  python -m pytest <node_ids...> --junitxml=/tmp/pytest_report.xml -p no:cacheprovider -o cache_dir=/tmp/pytest_cache -rN
+- The image's pytest is OLD (6.1.2). Do NOT rely on pytest-json-report (absent). For per-test pass/fail, run with built-in JUnit XML and parse it:
+  python -m pytest <node_ids...> --forked --junitxml=/tmp/pytest_report.xml -p no:cacheprovider -o cache_dir=/tmp/pytest_cache -rN
   run from repo_path_in_container; capture rc/stdout/stderr; then read & parse /tmp/pytest_report.xml.
+- REQUIRED: `--forked` (pytest-forked, shipped in the image) runs each test in its own subprocess. Ansible's CLI tests share process-global singletons (context.CLIARGS); without isolation they pollute each other and give order-dependent failures. Confirmed on our instance: WITHOUT --forked the gold state only scores 6/9 and pristine baseline mis-fails 3 "P2P" tests; WITH --forked, baseline = F2P fail + 8 P2P pass and gold = 9/9.
 - Outcome per <testcase>: child <failure> -> failed, <error> -> error, <skipped> -> skipped, none -> passed. "passed" means outcome==passed; an F2P "fails" = any non-passed outcome.
 - Map <testcase> -> node ID by the leaf test name (substring after the last "::"); disambiguate Class::method IDs by checking the class appears in <testcase classname>. Any expected node ID with NO testcase -> "missing".
 - Instance commit derived from instance_id via regex -([0-9a-f]{40})-v (confirmed in image history); shared helper, no hardcoding.
