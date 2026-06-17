@@ -6,3 +6,4 @@ bundles/*/artifacts/
 scratch/
 *.egg-info/
 .claude/settings.local.json
+CLAUDE.md
