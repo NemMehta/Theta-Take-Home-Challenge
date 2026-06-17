@@ -1,8 +1,6 @@
 # task (taskbundle)
 
-[![CI](https://github.com/OWNER/REPO/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/ci.yml)
-
-<!-- Replace OWNER/REPO with your GitHub slug; the badge resolves once pushed. -->
+[![CI](https://github.com/NemMehta/Theta-Take-Home-Challenge/actions/workflows/ci.yml/badge.svg)](https://github.com/NemMehta/Theta-Take-Home-Challenge/actions/workflows/ci.yml)
 
 A CLI that packages a SWE-bench-style coding task into a Docker container, hides the scored tests from a solver, runs a solver (stub or LLM), and scores the result — recording every run in a queryable database. Validated end-to-end on a Python (pytest) and a Go (`go test`) instance behind one runner abstraction.
 
