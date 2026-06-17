@@ -1,8 +1,12 @@
 # task (taskbundle)
 
 [![CI](https://github.com/NemMehta/Theta-Take-Home-Challenge/actions/workflows/ci.yml/badge.svg)](https://github.com/NemMehta/Theta-Take-Home-Challenge/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white) ![Docker](https://img.shields.io/badge/Docker-required-2496ED?logo=docker&logoColor=white) ![pytest](https://img.shields.io/badge/tested%20with-pytest-0A9EDC?logo=pytest&logoColor=white) ![Go](https://img.shields.io/badge/runner-go%20test-00ADD8?logo=go&logoColor=white)
 
 A CLI that packages a SWE-bench-style coding task into a Docker container, hides the scored tests from a solver, runs a solver (stub or LLM), and scores the result — recording every run in a queryable database. Validated end-to-end on a Python (pytest) and a Go (`go test`) instance behind one runner abstraction.
+
+> [!NOTE]
+> Two languages (pytest + Go) run behind one runner abstraction; five solvers span no-op through multi-turn agentic; isolation is enforced via `--network none` plus memory/CPU/PID limits; 31 unit tests run in CI.
 
 ## Architecture
 
@@ -28,6 +32,15 @@ flowchart TB
   end
   CLI -- "docker exec / docker cp" --> REPO
   TEST -- "per-test outcomes" --> CLI
+  classDef host fill:#E8F0FE,stroke:#4285F4,color:#0b1f44;
+  classDef container fill:#FEF7E0,stroke:#F9AB00,color:#3d2c00;
+  classDef ok fill:#E6F4EA,stroke:#34A853,color:#0b3d1a;
+  classDef bad fill:#FCE8E6,stroke:#EA4335,color:#5c1109;
+  classDef key fill:#F3E8FD,stroke:#A142F4,color:#2e0a4f;
+  class DB,MODEL host;
+  class MASK,PATCH,TEST container;
+  style HOST fill:#E8F0FE,stroke:#4285F4,color:#0b1f44;
+  style CONTAINER fill:#FEF7E0,stroke:#F9AB00,color:#3d2c00;
 ```
 
 A `run` **solves** then **scores** against a fresh baseline, so masking can never affect the score. Scoring runs with `--network none` plus memory/CPU/PID limits.
@@ -43,6 +56,14 @@ flowchart LR
   G --> H{"all F2P pass AND all P2P pass?"}
   H -- yes --> R["RESOLVED"]
   H -- no --> N["NOT RESOLVED"]
+  classDef host fill:#E8F0FE,stroke:#4285F4,color:#0b1f44;
+  classDef container fill:#FEF7E0,stroke:#F9AB00,color:#3d2c00;
+  classDef ok fill:#E6F4EA,stroke:#34A853,color:#0b3d1a;
+  classDef bad fill:#FCE8E6,stroke:#EA4335,color:#5c1109;
+  classDef key fill:#F3E8FD,stroke:#A142F4,color:#2e0a4f;
+  class R ok;
+  class N bad;
+  class D,G key;
 ```
 
 `validate` is the bundle guardrail: it runs the scored tests on the clean baseline (expect every fail-to-pass test failing, every pass-to-pass test passing) and again after the gold patch (expect all passing) — **VALID** only if both hold.
@@ -53,6 +74,12 @@ flowchart LR
   G1["baseline + gold patch"] --> E2{"all pass?"}
   E1 --> V{{"VALID iff both hold"}}
   E2 --> V
+  classDef host fill:#E8F0FE,stroke:#4285F4,color:#0b1f44;
+  classDef container fill:#FEF7E0,stroke:#F9AB00,color:#3d2c00;
+  classDef ok fill:#E6F4EA,stroke:#34A853,color:#0b3d1a;
+  classDef bad fill:#FCE8E6,stroke:#EA4335,color:#5c1109;
+  classDef key fill:#F3E8FD,stroke:#A142F4,color:#2e0a4f;
+  class V ok;
 ```
 
 ## What it does
@@ -125,6 +152,10 @@ BUNDLE=bundles/instance_ansible__ansible-cb94c0cc550df9e98f1247bc71d8c2b861c7504
    task run --bundle "$BUNDLE" --solver command --mask function --solver-cmd "python -c \"import socket; socket.setdefaulttimeout(5); socket.create_connection(('1.1.1.1',53))\" 2>/dev/null && echo NET_OK || echo NET_BLOCKED; echo '# touched by solver' >> lib/ansible/release.py"
    ```
 8. Real LLM solvers (these **spend Agent SDK credit** via the `claude` CLI):
+
+   > [!IMPORTANT]
+   > These solvers spend Agent SDK credit through the `claude` CLI and require `claude auth login` first.
+
    ```bash
    task run --bundle "$BUNDLE" --solver anthropic --mask function          # single-shot
    task run --bundle "$BUNDLE" --solver agentic   --mask function --model sonnet   # multi-turn
@@ -137,7 +168,10 @@ BUNDLE=bundles/instance_ansible__ansible-cb94c0cc550df9e98f1247bc71d8c2b861c7504
 
 ### Second language (Go)
 
-The same commands work on a Go repo — only `task.json`'s runner differs. Using the included flipt bundle:
+> [!TIP]
+> The same commands work on a Go repo — only `task.json`'s `test.runner` differs; no code changes are needed to switch languages.
+
+Using the included flipt bundle:
 
 ```bash
 GO=bundles/instance_flipt-io__flipt-518ec324b66a07fdd95464a5e9ca5fe7681ad8f9
