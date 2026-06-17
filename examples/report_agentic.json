@@ -1,0 +1,105 @@
+{
+  "run_id": "9e8fa71edfd643dab6174d2e05f0ea68",
+  "command_id": "7b721918f07e47a2bc1ddfec9c617c11",
+  "instance_id": "instance_ansible__ansible-cb94c0cc550df9e98f1247bc71d8c2b861c75049-v1055803c3a812189a1133297f7f5468579283f86",
+  "image": "jefzda/sweap-images:ansible.ansible-ansible__ansible-cb94c0cc550df9e98f1247bc71d8c2b861c75049-v1055803c3a812189a1133297f7f5468579283f86",
+  "image_digest": "jefzda/sweap-images@sha256:6ab0117a12033a0f55201e8f98d48e846a4e1d5903a4fdcdefcb3209b42bbcb0",
+  "base_commit": "96c19724394a32b9d3c596966be2f46e478681f8",
+  "instance_commit": "cb94c0cc550df9e98f1247bc71d8c2b861c75049",
+  "solver": {
+    "name": "agentic",
+    "meta": {
+      "mechanism": "claude -p agentic",
+      "model": "sonnet",
+      "cost_usd": 0.76235,
+      "max_turns": 30,
+      "turns_used": 25,
+      "files_changed": [
+        "lib/ansible/cli/adhoc.py",
+        "lib/ansible/cli/arguments/option_helpers.py",
+        "lib/ansible/cli/console.py",
+        "lib/ansible/playbook/task_include.py"
+      ],
+      "dropped_test_edits": [],
+      "model_reported": "claude-sonnet-4-6"
+    }
+  },
+  "mask": {
+    "strategy": "function",
+    "masked_files": [
+      "test/units/cli/test_adhoc.py"
+    ],
+    "total_tests_hidden": 9,
+    "scored_hidden": 9,
+    "non_scored_hidden": 0,
+    "non_scored_names": [],
+    "removed_tests": [
+      "test_parse",
+      "test_with_command",
+      "test_simple_command",
+      "test_no_argument",
+      "test_did_you_mean_playbook",
+      "test_play_ds_positive",
+      "test_play_ds_with_include_role",
+      "test_run_import_playbook",
+      "test_run_no_extra_vars"
+    ],
+    "preserved_tests": [
+      "test_ansible_version"
+    ],
+    "per_file": [
+      {
+        "file": "test/units/cli/test_adhoc.py",
+        "strategy_used": "function",
+        "removed": [
+          "test_parse",
+          "test_with_command",
+          "test_simple_command",
+          "test_no_argument",
+          "test_did_you_mean_playbook",
+          "test_play_ds_positive",
+          "test_play_ds_with_include_role",
+          "test_run_import_playbook",
+          "test_run_no_extra_vars"
+        ],
+        "preserved": [
+          "test_ansible_version"
+        ],
+        "fallback_reason": null
+      }
+    ]
+  },
+  "mask_verification": {
+    "scored_visible_after_mask": 0
+  },
+  "patch": {
+    "applied": true,
+    "apply_error": null,
+    "lines": 141
+  },
+  "scoring": {
+    "by_node": {
+      "test/units/cli/test_adhoc.py::test_play_ds_positive": "failed",
+      "test/units/cli/test_adhoc.py::test_with_command": "passed",
+      "test/units/cli/test_adhoc.py::test_play_ds_with_include_role": "failed",
+      "test/units/cli/test_adhoc.py::test_run_no_extra_vars": "passed",
+      "test/units/cli/test_adhoc.py::test_parse": "passed",
+      "test/units/cli/test_adhoc.py::test_run_import_playbook": "passed",
+      "test/units/cli/test_adhoc.py::test_did_you_mean_playbook": "passed",
+      "test/units/cli/test_adhoc.py::test_no_argument": "passed",
+      "test/units/cli/test_adhoc.py::test_simple_command": "passed"
+    },
+    "f2p": {
+      "total": 1,
+      "passed": 0
+    },
+    "p2p": {
+      "total": 8,
+      "passed": 7
+    }
+  },
+  "resolved": false,
+  "reason": "f2p_not_passed+p2p_regressed",
+  "started_at": "2026-06-17T01:20:07Z",
+  "finished_at": "2026-06-17T01:23:05Z"
+}

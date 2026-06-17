@@ -1,0 +1,22 @@
+{
+  "instance_id": "instance_flipt-io__flipt-518ec324b66a07fdd95464a5e9ca5fe7681ad8f9",
+  "image": "jefzda/sweap-images:flipt-io.flipt-flipt-io__flipt-518ec324b66a07fdd95464a5e9ca5fe7681ad8f9",
+  "base_commit": "0018c5df774444117b107dfe3fe503d4c7126d73",
+  "instance_commit": "518ec324b66a07fdd95464a5e9ca5fe7681ad8f9",
+  "phase_baseline": {
+    "by_node": {
+      "TestLoad": "failed"
+    },
+    "expectations_met": true,
+    "violations": []
+  },
+  "phase_gold": {
+    "by_node": {
+      "TestLoad": "passed"
+    },
+    "expectations_met": true,
+    "violations": []
+  },
+  "verdict": "VALID",
+  "checked_at": "2026-06-17T02:13:18Z"
+}
