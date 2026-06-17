@@ -694,7 +694,8 @@ def _run_bundle(bundle_dir, solver_name, solver_cmd, mask_strategy, out,
             report["mask_verification"]["scored_visible_after_mask"] = visible
 
             solve_res = solver.solve(c, repo_path, base_commit, bundle_dir,
-                                     mask_res, selected_test_files)
+                                     mask_res, selected_test_files,
+                                     artifacts_dir=artifacts_dir)
             report["solver"]["meta"] = solve_res.meta
             if solve_res.error:
                 error_exit(f"solver error: {solve_res.error}")
