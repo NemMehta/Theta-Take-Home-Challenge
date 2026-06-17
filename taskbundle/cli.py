@@ -135,8 +135,11 @@ def _init_from_dataset(instance_id: str, bundle: Optional[Path]) -> None:
 
 
 def _instance_commit_from_id(instance_id: str) -> Optional[str]:
-    """Extract the 40-hex instance commit embedded in a SWE-Bench Pro id."""
-    m = re.search(r"-([0-9a-f]{40})-v", instance_id)
+    """Extract the 40-hex instance commit embedded in a SWE-Bench Pro id, or None.
+
+    Matches both `-<sha>-v<digest>` (Python ids) and a trailing `-<sha>` (Go ids).
+    """
+    m = re.search(r"-([0-9a-f]{40})(?:-v|$)", instance_id)
     return m.group(1) if m else None
 
 
@@ -190,7 +193,11 @@ def _init_from_bundle(bundle_dir: Path) -> None:
     image = task["image"]
     base_commit = task["base_commit"]
     instance_id = task["instance_id"]
-    selected_test_files = task.get("test", {}).get("selected_test_files", [])
+    test_config = task.get("test", {})
+    runner_name = test_config.get("runner", "pytest")
+    selected_test_files = test_config.get("selected_test_files", [])
+    go_test_files = test_config.get("test_files", [])
+    go_packages = test_config.get("packages", [])
     scored = _load_scored(bundle_dir)
     instance_commit = _instance_commit_from_id(instance_id)
 
@@ -220,22 +227,35 @@ def _init_from_bundle(bundle_dir: Path) -> None:
                     fail(f"baseline normalization failed: {cmd}\n{err.strip()}")
             console.print(f"[green]✓[/green] baseline normalized to {base_commit[:12]}")
 
-            # (c) pytest collect-only on each selected file
+            # (c) verify the env/toolchain builds the tests.
             collected: list[str] = []
-            for tf in selected_test_files:
-                rc, out, err = c.exec(
-                    f"python -m pytest --collect-only -q {tf}", workdir=repo_path,
-                    timeout=600,
-                )
+            if runner_name == "go":
+                prefix, how = runner_mod._go_prefix(c, repo_path)
+                console.print(f"  go: {how}")
+                targets = " ".join(go_packages) if go_packages else "./..."
+                rc, out, err = c.exec(f"{prefix}go build {targets}",
+                                      workdir=repo_path, timeout=1800)
+                env_check = f"go build {targets} (go: {how})"
                 if rc != 0:
-                    fail(f"pytest --collect-only failed (rc={rc}) for {tf}\n"
+                    fail(f"go build failed (rc={rc}) for {targets}\n"
                          f"{(out + err).strip()[-1500:]}")
-                collected += _parse_collected(out, tf)
-            console.print(f"[green]✓[/green] pytest collected {len(collected)} item(s)")
-            missing = [n for n in scored if n not in collected]
-            if missing:
-                fail(f"scored node IDs missing from collection: {missing}")
-            console.print(f"[green]✓[/green] all {len(scored)} scored node IDs present in collection")
+                console.print(f"[green]✓[/green] {env_check} -> rc=0 (toolchain/deps OK)")
+            else:
+                for tf in selected_test_files:
+                    rc, out, err = c.exec(
+                        f"python -m pytest --collect-only -q {tf}", workdir=repo_path,
+                        timeout=600,
+                    )
+                    if rc != 0:
+                        fail(f"pytest --collect-only failed (rc={rc}) for {tf}\n"
+                             f"{(out + err).strip()[-1500:]}")
+                    collected += _parse_collected(out, tf)
+                console.print(f"[green]✓[/green] pytest collected {len(collected)} item(s)")
+                missing = [n for n in scored if n not in collected]
+                if missing:
+                    fail(f"scored node IDs missing from collection: {missing}")
+                console.print(f"[green]✓[/green] all {len(scored)} scored node IDs present in collection")
+                env_check = f"pytest collected {len(collected)}"
 
             # (d) git apply --check for gold + test patch
             apply_results = {}
@@ -252,7 +272,8 @@ def _init_from_bundle(bundle_dir: Path) -> None:
                     console.print(f"    {err.strip()}")
 
             # (e) diagnostics
-            tf0 = selected_test_files[0] if selected_test_files else ""
+            verify_files = selected_test_files or go_test_files
+            tf0 = verify_files[0] if verify_files else ""
             rc, out, _ = c.exec(
                 f"grep -nE '^(diff --git|\\+\\+\\+).*{re.escape(tf0)}' /tmp/test_patch.diff"
             )
@@ -289,7 +310,7 @@ def _init_from_bundle(bundle_dir: Path) -> None:
 
     gold_ok = apply_results.get("gold_patch.diff", (False, ""))[0]
     test_ok = apply_results.get("test_patch.diff", (False, ""))[0]
-    msg = (f"repo={repo_path}; collected={len(collected)}; "
+    msg = (f"repo={repo_path}; env_check={env_check}; "
            f"gold_apply={gold_ok}; test_apply={test_ok}")
     db.record_command(
         command_id=command_id, command="init", args_json=args_json,
@@ -449,7 +470,7 @@ def _validate_bundle(bundle_dir: Path, json_path: Optional[Path], keep_container
     base_commit = task["base_commit"]
     repo_path = task.get("repo_path_in_container") or "/app"
     instance_id = task["instance_id"]
-    selected_test_files = task.get("test", {}).get("selected_test_files", [])
+    test_config = task.get("test", {})
 
     f2p = json.loads((bundle_dir / "tests" / "fail_to_pass.json").read_text())
     p2p = json.loads((bundle_dir / "tests" / "pass_to_pass.json").read_text())
@@ -457,6 +478,7 @@ def _validate_bundle(bundle_dir: Path, json_path: Optional[Path], keep_container
 
     try:
         instance_commit = runner_mod.instance_commit_from_id(instance_id)
+        runner = runner_mod.get_runner(test_config.get("runner", "pytest"))
     except runner_mod.RunnerError as e:
         error_exit(str(e))
 
@@ -481,10 +503,10 @@ def _validate_bundle(bundle_dir: Path, json_path: Optional[Path], keep_container
             kept_name = c.name
             # PHASE B: baseline + staged tests, no gold
             _clean_baseline(c, repo_path, base_commit)
-            runner_mod.stage_tests(c, repo_path, instance_commit, selected_test_files)
-            res_b = runner_mod.run_pytest(c, repo_path, scored)
+            runner.stage(c, repo_path, instance_commit, test_config)
+            res_b = runner.run(c, repo_path, instance_commit, test_config, scored)
             if res_b.get("error"):
-                error_exit(f"phase B pytest could not run: {res_b['error']}\n"
+                error_exit(f"phase B tests could not run: {res_b['error']}\n"
                            f"stdout:\n{res_b['stdout_tail']}\nstderr:\n{res_b['stderr_tail']}")
             met_b, viol_b = _check_expectations(res_b["by_node"], f2p, p2p, f2p_should_pass=False)
             result["phase_baseline"] = {
@@ -497,10 +519,10 @@ def _validate_bundle(bundle_dir: Path, json_path: Optional[Path], keep_container
             rc, out, err = c.exec(f"git -C {repo_path} apply /tmp/gold_patch.diff")
             if rc != 0:
                 error_exit(f"gold patch failed to apply in phase C:\n{err.strip()}")
-            runner_mod.stage_tests(c, repo_path, instance_commit, selected_test_files)
-            res_c = runner_mod.run_pytest(c, repo_path, scored)
+            runner.stage(c, repo_path, instance_commit, test_config)
+            res_c = runner.run(c, repo_path, instance_commit, test_config, scored)
             if res_c.get("error"):
-                error_exit(f"phase C pytest could not run: {res_c['error']}\n"
+                error_exit(f"phase C tests could not run: {res_c['error']}\n"
                            f"stdout:\n{res_c['stdout_tail']}\nstderr:\n{res_c['stderr_tail']}")
             met_c, viol_c = _check_expectations(res_c["by_node"], f2p, p2p, f2p_should_pass=True)
             result["phase_gold"] = {
@@ -632,13 +654,15 @@ def _run_bundle(bundle_dir, solver_name, solver_cmd, mask_strategy, model, out,
     repo_path = task.get("repo_path_in_container") or "/app"
     instance_id = task["instance_id"]
     image_digest = task.get("image_digest")
-    selected_test_files = task.get("test", {}).get("selected_test_files", [])
+    test_config = task.get("test", {})
+    selected_test_files = test_config.get("selected_test_files", [])
     f2p = json.loads((bundle_dir / "tests" / "fail_to_pass.json").read_text())
     p2p = json.loads((bundle_dir / "tests" / "pass_to_pass.json").read_text())
     scored = list(f2p) + list(p2p)
 
     try:
         instance_commit = runner_mod.instance_commit_from_id(instance_id)
+        runner = runner_mod.get_runner(test_config.get("runner", "pytest"))
     except runner_mod.RunnerError as e:
         error_exit(str(e))
 
@@ -731,10 +755,10 @@ def _run_bundle(bundle_dir, solver_name, solver_cmd, mask_strategy, model, out,
             report["patch"]["lines"] = patch.count("\n")
 
             if report["patch"]["applied"]:
-                runner_mod.stage_tests(c, repo_path, instance_commit, selected_test_files)
-                scoring = runner_mod.run_pytest(c, repo_path, scored)
+                runner.stage(c, repo_path, instance_commit, test_config)
+                scoring = runner.run(c, repo_path, instance_commit, test_config, scored)
                 if scoring.get("error"):
-                    error_exit(f"scoring pytest could not run: {scoring['error']}\n"
+                    error_exit(f"scoring tests could not run: {scoring['error']}\n"
                                f"{scoring['stdout_tail']}\n{scoring['stderr_tail']}")
                 report["scoring"]["by_node"] = scoring["by_node"]
                 report["scoring"]["f2p"]["passed"] = sum(

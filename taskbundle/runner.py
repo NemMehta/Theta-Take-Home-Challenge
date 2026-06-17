@@ -7,6 +7,7 @@ run.
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 import xml.etree.ElementTree as ET
@@ -16,7 +17,9 @@ if TYPE_CHECKING:
     from taskbundle.container import ContainerHandle
 
 XML_PATH = "/tmp/pytest_report.xml"
-_INSTANCE_COMMIT_RE = re.compile(r"-([0-9a-f]{40})-v")
+# The instance commit is a 40-hex SHA embedded in the instance_id, either as
+# `-<sha>-v<digest>` (Python/ansible ids) or `-<sha>` at the end (Go ids).
+_INSTANCE_COMMIT_RE = re.compile(r"-([0-9a-f]{40})(?:-v|$)")
 
 
 class RunnerError(RuntimeError):
@@ -169,3 +172,118 @@ def _count(by_node):
     for outcome in by_node.values():
         counts[outcome] = counts.get(outcome, 0) + 1
     return counts
+
+
+# ---------------------------------------------------------------------------
+# Go runner (`go test -json`)
+# ---------------------------------------------------------------------------
+
+_GO_ACTION = {"pass": "passed", "fail": "failed", "skip": "skipped"}
+
+
+def parse_go_test_json(stream_text: str, expected_test_names: list) -> dict:
+    """Map each expected Go test name to an outcome from a `go test -json` stream.
+
+    Pure (mirrors parse_junit_xml). Each line of the stream is a JSON event; we
+    track the terminal Action per TOP-LEVEL test (subtest events, whose Test name
+    contains "/", are ignored for the parent's outcome). Rules:
+      - a name with a terminal pass/fail/skip -> passed/failed/skipped
+      - a name absent from a stream that DID have test events -> "missing"
+      - a stream with NO per-test events at all (e.g. a build/compile failure)
+        -> ALL expected names "error".
+    """
+    outcome: dict[str, str] = {}
+    saw_test_event = False
+    for line in stream_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        test = ev.get("Test")
+        if not test or "/" in test:
+            continue  # package-level or subtest event
+        saw_test_event = True
+        action = ev.get("Action")
+        if action in _GO_ACTION:
+            outcome[test] = _GO_ACTION[action]
+    if not saw_test_event:
+        return {name: "error" for name in expected_test_names}
+    return {name: outcome.get(name, "missing") for name in expected_test_names}
+
+
+def _go_prefix(handle, repo_path):
+    """Return (shell prefix to put `go` on PATH, human description)."""
+    rc, out, _ = handle.exec("command -v go", workdir=repo_path)
+    if rc == 0 and out.strip():
+        return "", f"go on PATH ({out.strip()})"
+    rc2, _, _ = handle.exec("test -x /usr/local/go/bin/go")
+    if rc2 == 0:
+        return "export PATH=/usr/local/go/bin:$PATH; ", "go via /usr/local/go/bin (PATH prepended)"
+    return "", "go not found"
+
+
+def run_go(handle, repo_path, test_config, scored_ids):
+    """Run the scored Go tests via `go test -json` per package; parse the stream."""
+    names = list(scored_ids)
+    packages = test_config.get("packages") or ["./..."]
+    prefix, how = _go_prefix(handle, repo_path)
+    pattern = "^(" + "|".join(re.escape(n) for n in names) + ")$"
+    stdout_all, stderr_all, rcs = [], [], []
+    for pkg in packages:
+        cmd = (f"{prefix}go test -json -run {shlex.quote(pattern)} "
+               f"-count=1 {shlex.quote(pkg)}")
+        rc, out, err = handle.exec(cmd, workdir=repo_path, timeout=1200)
+        stdout_all.append(out)
+        stderr_all.append(err)
+        rcs.append(rc)
+    stream = "\n".join(stdout_all)
+    by_node = parse_go_test_json(stream, names)
+    result = {
+        "rc": rcs[-1] if rcs else 0,
+        "by_node": by_node,
+        "raw_counts": _count(by_node),
+        "stdout_tail": _tail(stream),
+        "stderr_tail": _tail("\n".join(stderr_all)),
+        "go_invocation": how,
+    }
+    if not stream.strip():
+        result["error"] = (f"go test produced no JSON output (rc={rcs}); "
+                           f"go: {how}\n{result['stderr_tail']}")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Runner registry — validate/run dispatch on task.json["test"]["runner"].
+# ---------------------------------------------------------------------------
+
+class PytestRunner:
+    name = "pytest"
+
+    def stage(self, handle, repo_path, instance_commit, test_config):
+        stage_tests(handle, repo_path, instance_commit,
+                    test_config.get("selected_test_files", []))
+
+    def run(self, handle, repo_path, instance_commit, test_config, scored_ids):
+        return run_pytest(handle, repo_path, scored_ids)
+
+
+class GoRunner:
+    name = "go"
+
+    def stage(self, handle, repo_path, instance_commit, test_config):
+        stage_tests(handle, repo_path, instance_commit,
+                    test_config.get("test_files", []))
+
+    def run(self, handle, repo_path, instance_commit, test_config, scored_ids):
+        return run_go(handle, repo_path, test_config, scored_ids)
+
+
+def get_runner(name: str):
+    if name == "pytest":
+        return PytestRunner()
+    if name == "go":
+        return GoRunner()
+    raise RunnerError(f"unknown test runner: {name}")

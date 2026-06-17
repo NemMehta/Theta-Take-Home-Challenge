@@ -32,6 +32,49 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _test_files_from_setup(before_repo_set_cmd: str) -> list[str]:
+    """Extract test-file paths from the `git checkout <sha> -- <paths>` clause(s)
+    of before_repo_set_cmd, filtered to Go test files (*_test.go)."""
+    files: list[str] = []
+    for line in (before_repo_set_cmd or "").splitlines():
+        line = line.strip()
+        if line.startswith("git checkout") and " -- " in line:
+            for p in line.split(" -- ", 1)[1].split():
+                if p.endswith("_test.go"):
+                    files.append(p)
+    seen, out = set(), []
+    for f in files:
+        if f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out
+
+
+def _go_package(test_file: str) -> str:
+    """Go package path (./relative dir) for a test file."""
+    parent = Path(test_file).parent.as_posix()
+    return "." if parent == "." else "./" + parent
+
+
+def _build_test_block(language, f2p, p2p, selected_field, before_repo_set_cmd) -> dict:
+    """Language-specific `test` config. Python stays exactly as before."""
+    if language == "go":
+        test_files = _test_files_from_setup(before_repo_set_cmd)
+        packages: list[str] = []
+        for tf in test_files:
+            pkg = _go_package(tf)
+            if pkg not in packages:
+                packages.append(pkg)
+        return {
+            "runner": "go",
+            "scored_test_names": list(f2p) + list(p2p),
+            "test_files": test_files,
+            "packages": packages,
+        }
+    # pytest (Python and default) — unchanged.
+    return {"runner": "pytest", "selected_test_files": flatten_ids(selected_field)}
+
+
 def _build_description(row: dict[str, Any]) -> str:
     problem = (row.get("problem_statement") or "").strip()
     requirements = (row.get("requirements") or "").strip()
@@ -66,7 +109,14 @@ def build_bundle(item: dict[str, Any], bundle_dir: Path) -> dict[str, Any]:
 
     f2p = flatten_ids(row.get("fail_to_pass"))
     p2p = flatten_ids(row.get("pass_to_pass"))
-    test_files = flatten_ids(row.get("selected_test_files_to_run"))
+
+    test_block = _build_test_block(
+        language, f2p, p2p,
+        row.get("selected_test_files_to_run"), row.get("before_repo_set_cmd"),
+    )
+    # For the summary: number of test files (pytest) or Go test files.
+    n_test_files = len(test_block.get("selected_test_files",
+                                      test_block.get("test_files", [])))
 
     full_tag = row["dockerhub_tag"]
     image = f"{IMAGE_REPO}:{full_tag}"
@@ -83,7 +133,7 @@ def build_bundle(item: dict[str, Any], bundle_dir: Path) -> dict[str, Any]:
         "image_digest": None,
         "repo_path_in_container": None,
         "before_repo_set_cmd": row.get("before_repo_set_cmd"),
-        "test": {"runner": "pytest", "selected_test_files": test_files},
+        "test": test_block,
         "counts": {"fail_to_pass": len(f2p), "pass_to_pass": len(p2p)},
         "created_at": _now_iso(),
     }
@@ -117,5 +167,5 @@ def build_bundle(item: dict[str, Any], bundle_dir: Path) -> dict[str, Any]:
         "instance_id": instance_id,
         "n_f2p": len(f2p),
         "n_p2p": len(p2p),
-        "n_test_files": len(test_files),
+        "n_test_files": n_test_files,
     }

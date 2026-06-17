@@ -12,6 +12,12 @@ def test_extracts_40_hex_commit():
     assert instance_commit_from_id(iid) == "cb94c0cc550df9e98f1247bc71d8c2b861c75049"
 
 
+def test_extracts_trailing_commit_for_go_ids():
+    # Go instance ids end in `-<40hex>` with no `-v<digest>` suffix.
+    iid = "instance_flipt-io__flipt-518ec324b66a07fdd95464a5e9ca5fe7681ad8f9"
+    assert instance_commit_from_id(iid) == "518ec324b66a07fdd95464a5e9ca5fe7681ad8f9"
+
+
 def test_raises_when_pattern_absent():
     with pytest.raises(RunnerError):
         instance_commit_from_id("instance_without_any_commit_marker")

