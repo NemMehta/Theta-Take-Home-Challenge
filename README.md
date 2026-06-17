@@ -1,5 +1,9 @@
 # task (taskbundle)
 
+[![CI](https://github.com/OWNER/REPO/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/ci.yml)
+
+<!-- Replace OWNER/REPO with your GitHub slug; the badge resolves once pushed. -->
+
 A CLI that packages a SWE-bench-style coding task into a Docker container, hides the scored tests from a solver, runs a solver (LLM or stub), and scores the result — recording every run in a queryable database.
 
 ## What it does

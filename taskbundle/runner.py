@@ -86,7 +86,7 @@ def run_pytest(handle, repo_path, node_ids):
         }
 
     try:
-        testcases = _parse_testcases(xml_text)
+        by_node = parse_junit_xml(xml_text, node_ids)
     except ET.ParseError as e:
         return {
             "rc": rc,
@@ -97,7 +97,6 @@ def run_pytest(handle, repo_path, node_ids):
             "error": f"could not parse JUnit XML: {e}",
         }
 
-    by_node = _map_nodes(node_ids, testcases)
     return {
         "rc": rc,
         "by_node": by_node,
@@ -105,6 +104,16 @@ def run_pytest(handle, repo_path, node_ids):
         "stdout_tail": stdout_tail,
         "stderr_tail": stderr_tail,
     }
+
+
+def parse_junit_xml(xml_text: str, expected_node_ids: list) -> dict:
+    """Map each expected node ID to an outcome (passed|failed|error|skipped|missing).
+
+    Pure: parses JUnit XML and matches <testcase>s to node IDs by leaf name, using
+    the classname to disambiguate Class::method IDs. Raises ET.ParseError on
+    malformed XML (the caller decides how to surface it).
+    """
+    return _map_nodes(expected_node_ids, _parse_testcases(xml_text))
 
 
 def _parse_testcases(xml_text: str):

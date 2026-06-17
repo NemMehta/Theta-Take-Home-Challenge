@@ -13,6 +13,9 @@ dependencies = [
     "rich",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
 [project.scripts]
 task = "taskbundle.cli:main"
 

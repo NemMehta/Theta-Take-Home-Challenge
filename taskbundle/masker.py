@@ -122,6 +122,83 @@ def _apply_file_delete(handle, repo_path, tf, source, scored_node_ids, result,
     })
 
 
+@dataclass
+class PyMaskResult:
+    """Outcome of the pure AST mask transform for a single Python source string."""
+    ok: bool
+    new_source: Optional[str] = None
+    removed: list[str] = field(default_factory=list)
+    preserved: list[str] = field(default_factory=list)
+    fallback_reason: Optional[str] = None
+
+
+def mask_python_source(source: str, scored_targets: set) -> PyMaskResult:
+    """Remove the scored test funcs/methods from `source` (pure; no I/O).
+
+    `scored_targets` is a set of (class_name|None, func_name). Returns a
+    PyMaskResult: on success carries the rewritten source plus removed/preserved
+    leaf names; on any unsafe condition returns ok=False with a fallback reason
+    (parse failure, an unmatched scored target, or an edit that would not re-parse)
+    so the caller can fall back to a file-level delete (never under-hides).
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as e:
+        return PyMaskResult(ok=False, fallback_reason=f"parse failed: {e}")
+
+    edits: list[tuple[int, int, list[str]]] = []  # (start, end, replacement)
+    matched: set[tuple[Optional[str], str]] = set()
+    removed_leaves: list[str] = []
+
+    for node in tree.body:
+        if _is_test_def(node) and (None, node.name) in scored_targets:
+            s, e = _span(node)
+            edits.append((s, e, []))
+            matched.add((None, node.name))
+            removed_leaves.append(node.name)
+        elif isinstance(node, ast.ClassDef):
+            removed_methods = []
+            for sub in node.body:
+                if _is_test_def(sub) and (node.name, sub.name) in scored_targets:
+                    removed_methods.append(sub)
+                    matched.add((node.name, sub.name))
+                    removed_leaves.append(sub.name)
+            if not removed_methods:
+                continue
+            remaining = [st for st in node.body if st not in removed_methods]
+            # If removing empties the class body, replace the first removed
+            # method's span with a `pass` at its indent.
+            pass_idx = None
+            if not remaining:
+                first = min(removed_methods, key=lambda m: m.lineno)
+                pass_idx = id(first)
+            for m in removed_methods:
+                s, e = _span(m)
+                repl = [" " * m.col_offset + "pass\n"] if id(m) == pass_idx else []
+                edits.append((s, e, repl))
+
+    # SAFETY: every scored target must have matched.
+    unmatched = scored_targets - matched
+    if unmatched:
+        return PyMaskResult(
+            ok=False, fallback_reason=f"unmatched scored test(s): {sorted(unmatched)}")
+
+    # Apply edits to source lines, descending by start.
+    lines = source.splitlines(keepends=True)
+    for start, end, repl in sorted(edits, key=lambda x: x[0], reverse=True):
+        lines[start - 1:end] = repl
+    new_content = "".join(lines)
+
+    try:
+        ast.parse(new_content)
+    except SyntaxError as e:
+        return PyMaskResult(ok=False, fallback_reason=f"post-edit parse failed: {e}")
+
+    preserved_leaves = [p.split("::")[-1] for p in _collect_tests(new_content)]
+    return PyMaskResult(ok=True, new_source=new_content,
+                        removed=removed_leaves, preserved=preserved_leaves)
+
+
 class FunctionLevelMasker:
     """Remove only the scored test functions/methods via AST surgery; preserve
     all other tests. Falls back to file-level delete per-file when unsafe."""
@@ -144,78 +221,23 @@ class FunctionLevelMasker:
                 _apply_file_delete(handle, repo_path, tf, "", scored_node_ids, result,
                                    "file-fallback", "cat failed")
                 continue
-            try:
-                tree = ast.parse(source)
-            except SyntaxError as e:
+
+            res = mask_python_source(source, targets)
+            if not res.ok:
                 _apply_file_delete(handle, repo_path, tf, source, scored_node_ids, result,
-                                   "file-fallback", f"parse failed: {e}")
-                continue
-
-            edits: list[tuple[int, int, list[str]]] = []  # (start, end, replacement)
-            matched: set[tuple[Optional[str], str]] = set()
-            removed_leaves: list[str] = []
-
-            for node in tree.body:
-                if _is_test_def(node) and (None, node.name) in targets:
-                    s, e = _span(node)
-                    edits.append((s, e, []))
-                    matched.add((None, node.name))
-                    removed_leaves.append(node.name)
-                elif isinstance(node, ast.ClassDef):
-                    removed_methods = []
-                    for sub in node.body:
-                        if _is_test_def(sub) and (node.name, sub.name) in targets:
-                            removed_methods.append(sub)
-                            matched.add((node.name, sub.name))
-                            removed_leaves.append(sub.name)
-                    if not removed_methods:
-                        continue
-                    remaining = [st for st in node.body if st not in removed_methods]
-                    # If removing empties the class body, replace the first removed
-                    # method's span with a `pass` at its indent.
-                    pass_idx = None
-                    if not remaining:
-                        first = min(removed_methods, key=lambda m: m.lineno)
-                        pass_idx = id(first)
-                    for m in removed_methods:
-                        s, e = _span(m)
-                        repl = [" " * m.col_offset + "pass\n"] if id(m) == pass_idx else []
-                        edits.append((s, e, repl))
-
-            # SAFETY: every scored target for this file must have matched.
-            unmatched = targets - matched
-            if unmatched:
-                _apply_file_delete(handle, repo_path, tf, source, scored_node_ids, result,
-                                   "file-fallback",
-                                   f"unmatched scored test(s): {sorted(unmatched)}")
-                continue
-
-            # Apply edits to source lines, descending by start.
-            lines = source.splitlines(keepends=True)
-            for start, end, repl in sorted(edits, key=lambda x: x[0], reverse=True):
-                lines[start - 1:end] = repl
-            new_content = "".join(lines)
-
-            try:
-                ast.parse(new_content)
-            except SyntaxError as e:
-                _apply_file_delete(handle, repo_path, tf, source, scored_node_ids, result,
-                                   "file-fallback", f"post-edit parse failed: {e}")
+                                   "file-fallback", res.fallback_reason)
                 continue
 
             # Write the edited file back into the container working tree.
-            _write_back(handle, repo_path, tf, new_content)
-
-            preserved = _collect_tests(new_content)
-            preserved_leaves = [p.split("::")[-1] for p in preserved]
+            _write_back(handle, repo_path, tf, res.new_source)
             result.masked_files.append(tf)
-            result.total_tests_hidden += len(removed_leaves)
-            result.scored_hidden += len(removed_leaves)
-            result.removed_tests.extend(removed_leaves)
-            result.preserved_tests.extend(preserved_leaves)
+            result.total_tests_hidden += len(res.removed)
+            result.scored_hidden += len(res.removed)
+            result.removed_tests.extend(res.removed)
+            result.preserved_tests.extend(res.preserved)
             result.per_file.append({
                 "file": tf, "strategy_used": "function",
-                "removed": removed_leaves, "preserved": preserved_leaves,
+                "removed": res.removed, "preserved": res.preserved,
                 "fallback_reason": None,
             })
         return result

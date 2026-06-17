@@ -135,6 +135,46 @@ def _dominant_model(data: dict):
     return max(usage, key=lambda k: (usage[k] or {}).get("outputTokens", 0))
 
 
+def strip_code_fence(content: str) -> str:
+    """Drop a leading ```lang and trailing ``` fence the model may add."""
+    lines = content.splitlines()
+    if lines and re.match(r"^\s*```[\w.+-]*\s*$", lines[0]):
+        lines = lines[1:]
+        if lines and re.match(r"^\s*```\s*$", lines[-1]):
+            lines = lines[:-1]
+    return "\n".join(lines)
+
+
+def parse_file_blocks(text: str) -> dict:
+    """Parse `=== BEGIN FILE: <path> === ... === END FILE: <path> ===` blocks
+    into {path: content}, stripping any code fence the model wrapped them in."""
+    files = {}
+    pattern = re.compile(
+        r"=== BEGIN FILE: (.+?) ===[^\n]*\n(.*?)\n=== END FILE: \1 ===",
+        re.DOTALL,
+    )
+    for m in pattern.finditer(text):
+        files[m.group(1).strip()] = strip_code_fence(m.group(2))
+    return files
+
+
+def solver_path_reject_reason(path: str, selected_test_files) -> Optional[str]:
+    """Why a solver-returned path must be rejected, or None if it's allowed."""
+    if path.startswith("/") or ".." in path.split("/"):
+        return "not a safe repo-relative path"
+    if path in selected_test_files:
+        return "selected test file"
+    if _is_test_path(path):
+        return "test file"
+    return None
+
+
+def is_disallowed_solver_path(path: str, selected_test_files) -> bool:
+    """True if a solver must NOT be allowed to write `path` (escapes repo, or is
+    a scored/declared test file). Solvers may only edit source."""
+    return solver_path_reject_reason(path, selected_test_files) is not None
+
+
 def _significant_words(text: str) -> set[str]:
     return {w for w in re.findall(r"[a-z_]{4,}", text.lower())}
 
@@ -328,34 +368,11 @@ class AnthropicSolver:
         return [p for p in arr if isinstance(p, str) and p in cand_set][:_MAX_LOCATE]
 
     def _parse_file_blocks(self, text):
-        files = {}
-        pattern = re.compile(
-            r"=== BEGIN FILE: (.+?) ===[^\n]*\n(.*?)\n=== END FILE: \1 ===",
-            re.DOTALL,
-        )
-        for m in pattern.finditer(text):
-            files[m.group(1).strip()] = self._strip_code_fence(m.group(2))
-        return files
-
-    @staticmethod
-    def _strip_code_fence(content: str) -> str:
-        """Drop a leading ```lang and trailing ``` fence the model may add."""
-        lines = content.splitlines()
-        if lines and re.match(r"^\s*```[\w.+-]*\s*$", lines[0]):
-            lines = lines[1:]
-            if lines and re.match(r"^\s*```\s*$", lines[-1]):
-                lines = lines[:-1]
-        return "\n".join(lines)
+        return parse_file_blocks(text)
 
     # -- apply helpers --
     def _reject_reason(self, path, repo_path, selected_test_files):
-        if path.startswith("/") or ".." in path.split("/"):
-            return "not a safe repo-relative path"
-        if path in selected_test_files:
-            return "selected test file"
-        if _is_test_path(path):
-            return "test file"
-        return None
+        return solver_path_reject_reason(path, selected_test_files)
 
     def _write_file(self, handle, repo_path, path, content):
         tmp = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
