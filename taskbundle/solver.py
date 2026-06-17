@@ -109,9 +109,30 @@ _FILE_HEAD_LINES = 1500
 _FILE_MAX_BYTES = 60_000
 _TOTAL_BUDGET = 250_000
 
+_AGENTIC_TIMEOUT = 600
+_AGENTIC_MAX_TURNS = 30
+_AGENTIC_TOOLS = "Read,Edit,Write,Grep,Glob"  # file-only; NO Bash
+_DEFAULT_AGENTIC_MODEL = "sonnet"
+
 
 def _is_test_path(path: str) -> bool:
     return any(p.search(path) for p in _TEST_PATTERNS)
+
+
+def _dominant_model(data: dict):
+    """Best-effort name of the PRIMARY model from a claude JSON result.
+
+    Prefers the top-level `model`; otherwise picks the `modelUsage` entry with the
+    most output tokens (Claude Code also bills a cheap auxiliary model for
+    housekeeping, which must not be mistaken for the solver model)."""
+    if not isinstance(data, dict):
+        return None
+    if data.get("model"):
+        return data["model"]
+    usage = data.get("modelUsage") or {}
+    if not usage:
+        return None
+    return max(usage, key=lambda k: (usage[k] or {}).get("outputTokens", 0))
 
 
 def _significant_words(text: str) -> set[str]:
@@ -120,6 +141,9 @@ def _significant_words(text: str) -> set[str]:
 
 class AnthropicSolver:
     name = "anthropic"
+
+    def __init__(self, model: Optional[str] = None):
+        self.model = model  # None -> claude's own default
 
     def solve(self, handle, repo_path, base_commit, bundle_dir, mask,
               selected_test_files, artifacts_dir=None) -> SolverResult:
@@ -254,6 +278,8 @@ class AnthropicSolver:
             ptmp.close()
             args = ["timeout", str(_CLAUDE_TIMEOUT), "claude", "-p",
                     "--output-format", "json", "--allowedTools", "", "--max-turns", "1"]
+            if self.model:
+                args += ["--model", self.model]
             with open(ptmp.name, "r", encoding="utf-8") as stdin_f:
                 proc = subprocess.run(
                     args, cwd=tmpdir, stdin=stdin_f, capture_output=True, text=True,
@@ -287,11 +313,7 @@ class AnthropicSolver:
         if isinstance(data, dict):
             text = data.get("result") or data.get("text") or ""
         cost = (data.get("total_cost_usd") or data.get("cost_usd") or 0.0) if isinstance(data, dict) else 0.0
-        model = None
-        if isinstance(data, dict):
-            model = data.get("model") or (data.get("usage") or {}).get("model") \
-                or (data.get("modelUsage") and next(iter(data["modelUsage"]), None))
-        return {"text": text, "cost": cost or 0.0, "model": model, "raw": raw}
+        return {"text": text, "cost": cost or 0.0, "model": _dominant_model(data), "raw": raw}
 
     # -- response parsers --
     def _parse_located(self, text, candidates):
@@ -353,7 +375,186 @@ class AnthropicSolver:
             pass
 
 
-def get_solver(name: str, command: str | None = None):
+class AgenticSolver:
+    """Multi-turn agentic solver. Runs `claude -p` with file-only tools (NO Bash,
+    so no commands execute while solving) against a DISPOSABLE host copy of the
+    masked repo, then captures a source-only patch. Nothing the agent does touches
+    the scoring container — the existing run flow scores the patch in a fresh
+    `--network none` container, unchanged."""
+
+    name = "agentic"
+
+    def __init__(self, model: Optional[str] = None):
+        self.model = model or _DEFAULT_AGENTIC_MODEL
+
+    def solve(self, handle, repo_path, base_commit, bundle_dir, mask,
+              selected_test_files, artifacts_dir=None) -> SolverResult:
+        if shutil.which("claude") is None:
+            return SolverResult(
+                name=self.name,
+                error="claude CLI not found; install Claude Code and run `claude auth login`",
+            )
+
+        meta: dict[str, Any] = {
+            "mechanism": "claude -p agentic", "model": self.model,
+            "cost_usd": 0.0, "max_turns": _AGENTIC_MAX_TURNS, "turns_used": None,
+            "files_changed": [], "dropped_test_edits": [],
+        }
+
+        hosttmp = tempfile.mkdtemp(prefix="taskbundle-agentic-")
+        try:
+            repo = os.path.join(hosttmp, "repo")
+            # (b) copy the masked repo (incl. .git) out to the host
+            try:
+                handle.cp_from(repo_path, repo)
+            except Exception as e:  # noqa: BLE001
+                return SolverResult(name=self.name, meta=meta,
+                                    error=f"failed to stage repo copy for agent: {e}")
+            if not os.path.isdir(os.path.join(repo, ".git")):
+                return SolverResult(name=self.name, meta=meta,
+                                    error="failed to stage repo copy for agent (no .git)")
+            if self._git(repo, "cat-file", "-e", f"{base_commit}^{{commit}}").returncode != 0:
+                return SolverResult(name=self.name, meta=meta,
+                                    error="failed to stage repo copy for agent (base commit missing)")
+
+            # (c) build the task prompt
+            description = (Path(bundle_dir) / "description.md").read_text(encoding="utf-8")
+            prompt = self._build_prompt(description)
+            self._dump(artifacts_dir, "solver_agentic_prompt.txt", prompt)
+
+            # (d) run the agent on the host copy (file-only tools, no shell)
+            print("  [agentic] launching claude agent on a host copy of the masked "
+                  "repo (consumes Agent SDK credit; more than single-shot)...", flush=True)
+            result = self._run_agent(prompt, repo)
+            self._dump(artifacts_dir, "solver_agentic_transcript.json", result.get("raw", ""))
+            if result.get("error"):
+                meta["agent_error"] = result["error"]  # still capture partial edits
+            else:
+                meta["turns_used"] = result.get("turns")
+            meta["cost_usd"] = round(result.get("cost", 0.0), 6)
+            if result.get("model_reported"):
+                meta["model_reported"] = result["model_reported"]
+
+            # (f) source-only capture on the host copy
+            patch = self._capture(repo, base_commit, mask.masked_files, meta)
+            meta["files_changed"] = self._files_in_patch(patch)
+            if not patch.strip():
+                meta.setdefault("note", "agent produced no source change")
+                return SolverResult(name=self.name, patch="", meta=meta)
+            return SolverResult(name=self.name, patch=patch, meta=meta)
+        finally:
+            # (a) ALWAYS discard the host copy
+            shutil.rmtree(hosttmp, ignore_errors=True)
+
+    def _git(self, repo, *args, timeout=120):
+        return subprocess.run(["git", "-C", repo, *args],
+                              capture_output=True, text=True, timeout=timeout)
+
+    def _build_prompt(self, description):
+        return (
+            "You are fixing a real bug in the repository at your current working "
+            "directory.\n\n" + description.strip() + "\n\n"
+            "Implement the fix by editing the SOURCE files. Do NOT modify, create, "
+            "or delete any test files (anything under test/ or tests/, or matching "
+            "test_*.py / *_test.py / conftest.py). Make the change complete and "
+            "internally consistent. You do not have a shell; use file tools only."
+        )
+
+    def _run_agent(self, prompt, cwd):
+        ptmp = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8")
+        try:
+            ptmp.write(prompt)
+            ptmp.close()
+            args = ["timeout", str(_AGENTIC_TIMEOUT), "claude", "-p",
+                    "--allowedTools", _AGENTIC_TOOLS,
+                    "--permission-mode", "acceptEdits",
+                    "--max-turns", str(_AGENTIC_MAX_TURNS),
+                    "--model", self.model, "--output-format", "json"]
+            with open(ptmp.name, "r", encoding="utf-8") as stdin_f:
+                proc = subprocess.run(
+                    args, cwd=cwd, stdin=stdin_f, capture_output=True, text=True,
+                    timeout=_AGENTIC_TIMEOUT + 60,
+                )
+            raw = proc.stdout
+            if proc.returncode == 124:
+                return {"error": f"claude timed out after {_AGENTIC_TIMEOUT}s", "raw": raw}
+            if proc.returncode != 0:
+                combined = (proc.stdout + "\n" + proc.stderr).lower()
+                if any(k in combined for k in ("auth", "login", "unauthorized", "credit", "oauth")):
+                    return {"error": "claude auth/credit failure — run `claude auth login`",
+                            "raw": proc.stdout + proc.stderr}
+                return {"error": f"claude exited {proc.returncode}: {proc.stderr.strip()[:300]}",
+                        "raw": proc.stdout + proc.stderr}
+            return self._parse_agent_json(raw)
+        except subprocess.TimeoutExpired:
+            return {"error": f"claude timed out after {_AGENTIC_TIMEOUT}s", "raw": ""}
+        finally:
+            os.unlink(ptmp.name)
+
+    def _parse_agent_json(self, raw):
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return {"error": "could not parse claude JSON output", "raw": raw}
+        cost = data.get("total_cost_usd") or data.get("cost_usd") or 0.0
+        turns = data.get("num_turns")
+        out = {"cost": cost or 0.0, "turns": turns,
+               "model_reported": _dominant_model(data), "raw": raw}
+        if data.get("is_error"):
+            out["error"] = f"claude reported error: {str(data.get('result'))[:300]}"
+        return out
+
+    def _capture(self, repo, base_commit, masked_files, meta):
+        """Restore masked + agent-touched test files to baseline (and drop any
+        agent/CLI metadata), then diff the staged tree -> a SOURCE-only patch."""
+        for tf in masked_files:
+            self._git(repo, "checkout", base_commit, "--", tf)
+        dropped = []
+        for line in self._git(repo, "status", "--porcelain").stdout.splitlines():
+            if not line.strip():
+                continue
+            code, path = line[:2], line[3:].strip()
+            if " -> " in path:  # rename: keep the new path
+                path = path.split(" -> ", 1)[1]
+            path = path.strip('"')
+            is_test = _is_test_path(path)
+            is_meta = path == ".claude" or path.startswith(".claude/")
+            if not (is_test or is_meta):
+                continue
+            if code.strip() == "??":  # untracked: remove the file or dir
+                self._remove_path(repo, path)
+            else:  # tracked: restore to baseline
+                self._git(repo, "checkout", base_commit, "--", path)
+            if is_test:
+                dropped.append(path)
+        meta["dropped_test_edits"] = dropped
+        self._git(repo, "add", "-A")
+        return self._git(repo, "diff", "--cached").stdout
+
+    @staticmethod
+    def _remove_path(repo, path):
+        full = os.path.join(repo, path.rstrip("/"))
+        try:
+            if os.path.isdir(full):
+                shutil.rmtree(full, ignore_errors=True)
+            else:
+                os.remove(full)
+        except OSError:
+            pass
+
+    def _files_in_patch(self, patch):
+        return re.findall(r"^diff --git a/(.+?) b/", patch, re.MULTILINE)
+
+    def _dump(self, artifacts_dir, name, content):
+        if artifacts_dir is None:
+            return
+        try:
+            (Path(artifacts_dir) / name).write_text(content or "", encoding="utf-8")
+        except OSError:
+            pass
+
+
+def get_solver(name: str, command: str | None = None, model: str | None = None):
     if name == "noop":
         return NoopSolver()
     if name == "gold":
@@ -361,5 +562,7 @@ def get_solver(name: str, command: str | None = None):
     if name == "command":
         return CommandSolver(command)
     if name == "anthropic":
-        return AnthropicSolver()
+        return AnthropicSolver(model)
+    if name == "agentic":
+        return AgenticSolver(model)
     raise ValueError(f"unknown solver: {name}")

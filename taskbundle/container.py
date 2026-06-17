@@ -84,6 +84,17 @@ class ContainerHandle:
         if rc != 0:
             raise ContainerError(f"docker cp {src} -> {dst} failed: {err.strip()}")
 
+    def cp_from(self, src: str, dst: str, timeout: int = 300) -> None:
+        """Copy `src` (a path inside the container) out to host path `dst`.
+
+        Used by the agentic solver to stage a disposable host copy of the masked
+        repo. If `dst` does not exist, docker creates it with the contents of a
+        source directory (including .git).
+        """
+        rc, _, err = _run(["docker", "cp", f"{self.name}:{src}", dst], timeout=timeout)
+        if rc != 0:
+            raise ContainerError(f"docker cp {self.name}:{src} -> {dst} failed: {err.strip()}")
+
 
 # Keep-alive entrypoints to try, in order. Each must keep PID 1 alive.
 _KEEPALIVE = [

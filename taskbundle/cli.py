@@ -44,6 +44,7 @@ class Solver(str, Enum):
     gold = "gold"
     command = "command"
     anthropic = "anthropic"
+    agentic = "agentic"
 
 
 class Mask(str, Enum):
@@ -563,6 +564,10 @@ def run(
     mask: Mask = typer.Option(
         Mask.file, "--mask", help="Test-hiding strategy shown to the solver."
     ),
+    model: Optional[str] = typer.Option(
+        None, "--model",
+        help="Model for LLM solvers (e.g. 'sonnet', 'opus'); default depends on the solver.",
+    ),
     out: Optional[Path] = typer.Option(
         None, "--out", help="Write the JSON report to this path."
     ),
@@ -578,18 +583,18 @@ def run(
     ),
 ) -> None:
     """Run a solver against a bundle and score the result."""
-    _run_bundle(Path(bundle), solver.value, solver_cmd, mask.value, out,
+    _run_bundle(Path(bundle), solver.value, solver_cmd, mask.value, model, out,
                 no_network, keep_container)
 
 
-def _run_bundle(bundle_dir, solver_name, solver_cmd, mask_strategy, out,
+def _run_bundle(bundle_dir, solver_name, solver_cmd, mask_strategy, model, out,
                 no_network, keep_container) -> None:
     run_id = uuid.uuid4().hex
     command_id = uuid.uuid4().hex
     started_at = _now_iso()
     args_json = json.dumps({
         "bundle": str(bundle_dir), "solver": solver_name, "solver_cmd": solver_cmd,
-        "mask": mask_strategy, "out": str(out) if out else None,
+        "mask": mask_strategy, "model": model, "out": str(out) if out else None,
         "no_network": no_network, "keep_container": keep_container,
     }, sort_keys=True)
     db.init_db()
@@ -613,7 +618,7 @@ def _run_bundle(bundle_dir, solver_name, solver_cmd, mask_strategy, out,
         console.print(f"[yellow]mask '{mask_strategy}' not implemented yet:[/yellow] {e}")
         raise typer.Exit(code=0)
     try:
-        solver = solver_mod.get_solver(solver_name, solver_cmd)
+        solver = solver_mod.get_solver(solver_name, solver_cmd, model=model)
     except NotImplementedError as e:
         console.print(f"[yellow]solver '{solver_name}' not implemented yet:[/yellow] {e}")
         raise typer.Exit(code=0)
@@ -646,6 +651,7 @@ def _run_bundle(bundle_dir, solver_name, solver_cmd, mask_strategy, out,
 
     console.print(f"Running [cyan]{instance_id}[/cyan]")
     console.print(f"  solver: {solver_name}  |  mask: {mask_strategy}  |  "
+                  f"model: {model or 'default'}  |  "
                   f"network: {network or 'default'}  |  run_id: {run_id[:12]}")
 
     report = {
