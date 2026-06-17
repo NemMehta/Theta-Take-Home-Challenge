@@ -1,4 +1,4 @@
-# task (taskbundle)
+# Theta - Taskbundle
 
 [![CI](https://github.com/NemMehta/Theta-Take-Home-Challenge/actions/workflows/ci.yml/badge.svg)](https://github.com/NemMehta/Theta-Take-Home-Challenge/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white) ![Docker](https://img.shields.io/badge/Docker-required-2496ED?logo=docker&logoColor=white) ![pytest](https://img.shields.io/badge/tested%20with-pytest-0A9EDC?logo=pytest&logoColor=white) ![Go](https://img.shields.io/badge/runner-go%20test-00ADD8?logo=go&logoColor=white)
